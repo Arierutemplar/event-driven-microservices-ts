@@ -1,0 +1,13 @@
+{
+  "name": "microservices-core",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "user-service",
+    "order-service",
+    "notification-service"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces"
+  }
+}

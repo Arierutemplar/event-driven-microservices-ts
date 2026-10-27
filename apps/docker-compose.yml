@@ -1,0 +1,31 @@
+services:
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    env_file:
+      - ./order-service/.env
+    environment:
+      PORT: ${ORDER_SERVICE_PORT:-3000}
+      USER_SERVICE_URL: user-service:50051
+    ports:
+      - "${ORDER_SERVICE_PORT:-3000}:${ORDER_SERVICE_PORT:-3000}"
+    depends_on:
+      - user-service
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    env_file:
+      - ./notification-service/.env
+    restart: unless-stopped
