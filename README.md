@@ -1,146 +1,234 @@
-# Enterprise Event-Driven Microservices Monorepo
+# Event-Driven Order Platform
 
-Monorepo de referencia para una arquitectura distribuida de órdenes basada en TypeScript, gRPC y mensajería con RabbitMQ. Reúne patrones habituales en sistemas backend: validación síncrona entre servicios, persistencia con Prisma, publicación asíncrona de eventos, circuit breaker, correlación de solicitudes y Dead Letter Queue (DLQ).
+TypeScript monorepo for a small order flow split across three independently deployed services. An HTTP client creates an order on `order-service`. That service validates the user with a synchronous gRPC call, stores the order in its own SQLite database, and publishes an `order.created` event to RabbitMQ. `notification-service` consumes that event on its own schedule and records it. `user-service` does not share a database, a process, or a deployable with either of the others.
 
-El diseño evita acoplar la aplicación a un proveedor cloud específico: usa protocolos y componentes que pueden ejecutarse localmente o en plataformas compatibles. La configuración incluida utiliza `RABBITMQ_URL` y puede apuntar a CloudAMQP. **Este repositorio es una base demostrativa y no debe considerarse lista para producción sin las mejoras operativas descritas en [Limitaciones y siguientes pasos](#-limitaciones-y-siguientes-pasos).**
+The workspace root is [`apps/`](apps/). There is no separate API gateway: `order-service` is the synchronous edge. There is no Redis, NATS, Prometheus, Grafana, or Jaeger instrumentation in this repository. Observability is correlation identifiers, structured logs, and the RabbitMQ management UI.
 
-## 📚 Índice
+This is a reference implementation of the communication patterns below. It is not a production deployment. gRPC is plaintext, the user catalog is a single in-memory record, and the order write and the event publish are not in one transaction.
 
-- [Arquitectura](#-arquitectura)
-- [Patrones y capacidades](#-patrones-y-capacidades)
-- [Stack tecnológico](#-stack-tecnológico)
-- [Estructura del repositorio](#-estructura-del-repositorio)
-- [Requisitos previos](#-requisitos-previos)
-- [Configuración local](#-configuración-local)
-- [Ejecución en desarrollo](#-ejecución-en-desarrollo)
-- [Pruebas y compilación](#-pruebas-y-compilación)
-- [Prueba del flujo HTTP](#-prueba-del-flujo-http)
-- [Dead Letter Queue](#-dead-letter-queue)
-- [Ejecución con Docker Compose](#-ejecución-con-docker-compose)
-- [Limitaciones y siguientes pasos](#-limitaciones-y-siguientes-pasos)
+## Key Architectural Highlights
 
-## 🏛️ Arquitectura
+- **Deployable isolation.** `user-service`, `order-service`, and `notification-service` are separate npm workspaces, separate Docker images, and separate processes. A failure in the consumer does not stop order creation. A failure in user lookup stops order creation on purpose, because that check is on the synchronous path.
+- **Two communication styles.** User validation is request/response gRPC (`UserService.GetUserById`). Order notification is asynchronous AMQP. The HTTP handler does not wait for the consumer.
+- **State ownership.** Only `order-service` persists data. Prisma maps an `Order` model to SQLite. `user-service` answers from a hard-coded user (`id: "1"`, Ada Lovelace) and returns `NOT_FOUND` for every other id. `notification-service` keeps no store; its side effect is a log line.
+- **Eventual consistency, with a real gap.** After the row commits, the handler publishes `order.created` on a confirm channel. If that publish fails, the API returns `503` and the row remains. There is no transactional outbox, so a crash between those two steps loses the event while keeping the order.
+- **Failure containment on the sync path.** The gRPC client sets a 3 second deadline and is wrapped in an Opossum circuit breaker. When the breaker is open, or the user service cannot be reached, the handler returns `503` and does not write an order.
+- **Failure containment on the async path.** The `orders` queue is durable and dead-letters to `orders.dlx` / `orders.dlq`. The consumer acknowledges a parsed message and `nack`s an unparseable one with `requeue: false`, so a poison body does not spin on the main queue.
 
-```mermaid
-flowchart LR
-    Client[Cliente HTTP] -->|POST /orders| Order[order-service<br/>Express + Prisma]
-    Order -->|GetUserById<br/>gRPC + correlation ID| User[user-service<br/>gRPC]
-    Order -->|Guardar orden| DB[(SQLite)]
-    Order -->|order.created<br/>RabbitMQ + correlationId| Queue[(orders)]
-    Queue -->|Consumo asíncrono| Notification[notification-service<br/>amqplib + pino]
-    Queue -->|nack sin requeue| DLX{orders.dlx}
-    DLX -->|routing key: orders.dlq| DLQ[(orders.dlq)]
+| Service | Interface | State | Role in the flow |
+| --- | --- | --- | --- |
+| `user-service` | gRPC `0.0.0.0:50051` | In-memory mock user | Answers `GetUserById` |
+| `order-service` | HTTP `POST /orders` (default port `3000`) | SQLite via Prisma | Validates, persists, publishes |
+| `notification-service` | AMQP consumer, no inbound port | None | Logs `orders` deliveries |
+
+Shared contract: [`apps/proto/user.proto`](apps/proto/user.proto). Event contract, published as persistent JSON to the `orders` queue:
+
+```json
+{
+  "event": "order.created",
+  "data": {
+    "id": "<uuid>",
+    "userId": "1",
+    "productId": "prod-123",
+    "quantity": 2,
+    "createdAt": "<timestamp>"
+  }
+}
 ```
 
-### Servicios
+`order-service` publishes with `sendToQueue`, so the message enters through RabbitMQ's default exchange. The only application exchange is the dead-letter exchange.
 
-| Servicio | Responsabilidad |
-| --- | --- |
-| **`user-service`** | Servidor gRPC en el puerto `50051`. Implementa `UserService.GetUserById` según [`proto/user.proto`](./proto/user.proto). La implementación actual valida contra un usuario mock: `id: "1"`, Ada Lovelace. |
-| **`order-service`** | API REST con Express. `POST /orders` valida la solicitud, consulta al usuario por gRPC, persiste la orden con Prisma en SQLite y publica el evento `order.created` en RabbitMQ. |
-| **`notification-service`** | Consumidor asíncrono de la cola durable `orders`. Registra los eventos con Pino; confirma los mensajes procesados y envía mensajes no procesables a la DLQ. |
+## Architecture Diagram
 
-El endpoint de órdenes espera un JSON con `userId`, `productId` y `quantity`. La cantidad debe ser un entero positivo.
+```mermaid
+flowchart TB
+  client["HTTP clients"]
 
-## 🧩 Patrones y capacidades
+  subgraph edge["Synchronous edge"]
+    order["order-service<br/>Express 5 · POST /orders<br/>correlation id + publisher confirms"]
+  end
 
-- **Comunicación híbrida:** gRPC síncrono para validar usuarios y RabbitMQ asíncrono para publicar eventos desacoplados.
-- **Circuit breaker:** `opossum` envuelve la llamada gRPC desde `order-service`. El circuito usa un timeout de 3000 ms y un umbral de errores del 50%; su fallback devuelve un error de indisponibilidad cuando está abierto.
-- **Resiliencia con DLQ:** la cola `orders` declara `x-dead-letter-exchange: orders.dlx` y `x-dead-letter-routing-key: orders.dlq`. El consumidor procesa el JSON en un bloque `try/catch`; ante un error, ejecuta `nack(msg, false, false)` para no reencolar el mensaje en un bucle.
-- **Trazabilidad distribuida:** `order-service` acepta o genera un `correlationId`, lo devuelve en el header HTTP `x-correlation-id`, lo envía como metadata gRPC y lo publica en los headers del mensaje RabbitMQ. Los logs de `user-service` y `notification-service` incluyen ese identificador.
-- **Persistencia:** Prisma ORM v5 y SQLite. El modelo `Order` genera el ID y la fecha de creación.
-- **Logging estructurado:** Pino en `user-service` y `notification-service`. `order-service` usa actualmente `console` para registrar errores.
-- **Monorepo:** npm workspaces, TypeScript estricto, ESM y extensiones `.js` en imports relativos.
-- **Contenedores:** Dockerfiles multi-stage basados en `node:20-alpine` y orquestación de los tres servicios con Docker Compose.
-- **Pruebas:** Jest está configurado en `order-service`. La prueba existente es una comprobación estructural básica; todavía no cubre integraciones reales con gRPC, RabbitMQ o SQLite.
+  user["user-service<br/>gRPC UserService.GetUserById<br/>in-memory user id = 1"]
+  sqlite[("order-service SQLite<br/>Order table · Prisma<br/>no shared database")]
 
-## 🛠️ Stack tecnológico
+  subgraph broker["RabbitMQ"]
+    ordersQ["durable queue: orders<br/>default exchange"]
+    dlx["direct exchange: orders.dlx"]
+    dlq[("durable queue: orders.dlq")]
+  end
 
-| Tecnología | Uso |
-| --- | --- |
-| Node.js 20 | Runtime y base de las imágenes Docker |
-| TypeScript | Implementación con `strict` y módulos ESM |
-| Express 5 | API HTTP de `order-service` |
-| `@grpc/grpc-js` | Servidor y cliente gRPC |
-| `@grpc/proto-loader` | Carga del contrato Protocol Buffers |
-| RabbitMQ / `amqplib` | Transporte de eventos, confirmaciones y DLQ |
-| Prisma ORM 5 | Acceso a datos y generación de IDs |
-| SQLite | Base de datos de órdenes para desarrollo |
-| Opossum | Circuit breaker para la llamada gRPC |
-| Pino | Logging JSON estructurado |
-| Jest / ts-jest | Pruebas de `order-service` |
-| Docker / Compose | Empaquetado y ejecución de los servicios |
+  notification["notification-service<br/>manual ack · Pino"]
+  observe["Observability<br/>x-correlation-id<br/>Pino JSON logs<br/>RabbitMQ management UI :15672"]
 
-## 🗂️ Estructura del repositorio
+  client -->|"POST /orders<br/>optional x-correlation-id"| order
+  order -->|"gRPC metadata x-correlation-id<br/>deadline 3s · Opossum"| user
+  order -->|"prisma.order.create"| sqlite
+  order -->|"order.created<br/>persistent JSON · confirm channel"| ordersQ
+  ordersQ -->|"consume"| notification
+  ordersQ -->|"nack requeue=false"| dlx
+  dlx -->|"routing key orders.dlq"| dlq
+  order -.-> observe
+  user -.-> observe
+  notification -.-> observe
+  ordersQ -.-> observe
+```
+
+There is no gateway process in front of `order-service`. Clients call that service directly. `user-service` is reachable only over gRPC. `notification-service` has no request API.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant O as order-service
+  participant U as user-service
+  participant DB as SQLite
+  participant Q as RabbitMQ orders
+  participant N as notification-service
+
+  C->>O: POST /orders (x-correlation-id or generated UUID)
+  O->>U: GetUserById + metadata
+  alt user missing
+    U-->>O: NOT_FOUND
+    O-->>C: 404
+  else user service failing or circuit open
+    U-->>O: UNAVAILABLE / timeout
+    O-->>C: 503
+  else user id is 1
+    U-->>O: Ada Lovelace
+    O->>DB: INSERT Order
+    O->>Q: order.created (persistent, confirm)
+    Q-->>O: broker confirm
+    O-->>C: 201 + x-correlation-id
+    Q->>N: delivery
+    N->>N: JSON.parse and log correlationId
+    N->>Q: ack
+  end
+```
+
+## Distributed Resilience & Event Patterns
+
+What the code actually does:
+
+| Pattern | Where | Behavior |
+| --- | --- | --- |
+| Publisher confirms | `order-service` broker | `createConfirmChannel()` and `waitForConfirms()` after `sendToQueue`. The handler returns `201` only after the broker confirms. |
+| Durable messaging | both AMQP clients | Queue `orders`, exchange `orders.dlx`, and queue `orders.dlq` are declared durable. Messages are published with `persistent: true`. |
+| Dead-letter queue | both AMQP clients | `orders` is declared with `x-dead-letter-exchange=orders.dlx` and `x-dead-letter-routing-key=orders.dlq`. `orders.dlq` is bound to that exchange. |
+| Poison-message rejection | `notification-service` | `JSON.parse` failure logs the error and calls `nack(message, false, false)`. The message is dead-lettered instead of requeued. |
+| Circuit breaker | `order-service` gRPC client | Opossum wraps `GetUserById` with `timeout: 3000` and `errorThresholdPercentage: 50`. An open circuit rejects with `UNAVAILABLE` before placing another call. |
+| Call deadline | same gRPC client | Each attempt also sets a gRPC deadline of 3 seconds. |
+| Correlation | HTTP, gRPC, AMQP | Missing `x-correlation-id` becomes a UUID. The value is returned on the HTTP response, sent as gRPC metadata, and set on the AMQP header `correlationId`. |
+
+Library defaults that this code does not override, from Opossum 10: `resetTimeout` is 30 seconds and `volumeThreshold` is 0. The breaker opens when the failure rate is **greater than** 50 percent. With a zero volume threshold, the first rejected call is a 100 percent failure rate, so one failed lookup opens the circuit for 30 seconds.
+
+`GetUserById` rejects on `NOT_FOUND`. That rejection is a breaker failure, not a successful business response. A request for an unknown user can open the circuit and make the next request for user `1` return `503` until the reset window elapses.
+
+Not implemented, and not claimed:
+
+- **Transactional outbox.** Persist and publish are sequential. A confirmed publish can still be followed by a process crash before the HTTP response is written; the reverse failure (row committed, publish failed) returns `503` with the row left in place.
+- **Consumer idempotency.** Any body that parses as JSON is logged and acknowledged, including duplicates and payloads that are not `order.created`. There is no inbox table or deduplication key. Repeating `POST /orders` creates a new order id and a new event.
+- **Retry with backoff.** There is no retry loop in the consumer and no delay queue. Unparseable messages go straight to `orders.dlq`. Nothing in this repo consumes that queue.
+- **Broker prefetch.** The consumer does not set QoS.
+- **Health or metrics endpoints.** Container health checks in Compose probe TCP ports (and process liveness for the consumer). The applications do not expose `/health` or `/metrics`.
+
+## Monorepo Setup & Local Development
+
+### Layout
 
 ```text
 .
-├── docker-compose.yml
-├── proto/
-│   └── user.proto
-├── user-service/
-│   ├── Dockerfile
-│   └── src/index.ts
-├── order-service/
-│   ├── Dockerfile
-│   ├── prisma/schema.prisma
-│   └── src/
-│       ├── broker/index.ts
-│       ├── controllers/index.ts
-│       ├── grpc/index.ts
-│       └── index.ts
-└── notification-service/
-    ├── Dockerfile
-    └── src/
-        ├── consumer/index.ts
-        └── index.ts
+├── README.md
+└── apps/                          npm workspace root (microservices-core)
+    ├── package.json               workspaces: user, order, notification
+    ├── package-lock.json
+    ├── docker-compose.yml
+    ├── proto/user.proto
+    ├── user-service/
+    ├── order-service/             Prisma schema, Jest, circuit breaker
+    └── notification-service/
 ```
 
-## ✅ Requisitos previos
+Tooling is npm workspaces on Node.js 20, TypeScript `strict`, and ESM (`NodeNext`, `.js` specifiers in relative imports). It is not a pnpm or Yarn workspace.
 
-- Node.js 20 o superior y npm.
-- Una instancia RabbitMQ accesible por AMQP. Para el flujo descrito se puede usar CloudAMQP u otro broker compatible.
-- Docker Engine y Docker Compose v2, si se ejecuta en contenedores.
+### Prerequisites
 
-## ⚙️ Configuración local
+- Node.js 20 or newer, with npm
+- Docker Engine and Docker Compose v2, for the broker and the full stack
 
-Instala las dependencias desde la raíz del repositorio:
+### Run the whole stack
+
+From `apps/`:
 
 ```bash
-npm install
+docker compose up --build
 ```
 
-Crea `order-service/.env` y `notification-service/.env`. No subas credenciales al control de versiones.
+Compose builds each service with its own multi-stage Dockerfile. The build context is `apps/`, because each Dockerfile copies the workspace lockfile and the shared proto. Startup order is enforced with health checks:
 
-`order-service/.env`:
+1. RabbitMQ must answer `rabbitmq-diagnostics ping`.
+2. `user-service` must accept TCP connections on port `50051`.
+3. `order-service` and `notification-service` start only after the broker is healthy. `order-service` also waits for `user-service`.
+4. `order-service` is marked healthy once it accepts TCP connections on port `3000`.
+
+`order-service` runs `prisma db push` on container start, then drops privileges to the `node` user. The SQLite file is stored in the `order-data` volume at `/app/order-service/data/orders.db`. RabbitMQ data is stored in `rabbitmq-data`. Two bridge networks separate traffic: `service-mesh` (gRPC between order and user) and `messaging` (AMQP). Only `order-service` joins both.
+
+Published ports:
+
+| Port | Process |
+| --- | --- |
+| `3000` | `order-service` HTTP. Override the host port with `ORDER_SERVICE_PORT`. |
+| `50051` | `user-service` gRPC |
+| `5672` | AMQP |
+| `15672` | RabbitMQ management UI (`orders` / `orders`) |
+
+The Compose broker user and password are local defaults. Do not reuse them anywhere else, and do not commit a real `RABBITMQ_URL`. Compose sets the URL itself and does not load service `.env` files.
+
+Stop and keep volumes:
+
+```bash
+docker compose down
+```
+
+Stop and delete volumes:
+
+```bash
+docker compose down -v
+```
+
+### Run services on the host
+
+Start only the broker:
+
+```bash
+cd apps
+docker compose up rabbitmq
+```
+
+Install workspaces and create the SQLite schema:
+
+```bash
+cd apps
+npm install
+npm exec --workspace=order-service -- prisma db push
+```
+
+Create `apps/order-service/.env`:
 
 ```dotenv
 PORT=3000
-RABBITMQ_URL=amqps://<usuario>:<contraseña>@<host>/<vhost>
+USER_SERVICE_URL=localhost:50051
+RABBITMQ_URL=amqp://orders:orders@localhost:5672
 DATABASE_URL="file:./dev.db"
 ```
 
-`notification-service/.env`:
+Create `apps/notification-service/.env`:
 
 ```dotenv
-RABBITMQ_URL=amqps://<usuario>:<contraseña>@<host>/<vhost>
+RABBITMQ_URL=amqp://orders:orders@localhost:5672
 ```
 
-Reemplaza la URL de ejemplo por la URL AMQP de tu instancia. `DATABASE_URL` es la URL de conexión de SQLite que Prisma lee para el esquema en `order-service/prisma/schema.prisma`.
+`DATABASE_URL` is read by Prisma from `order-service/prisma/schema.prisma`. A relative SQLite URL is resolved from that schema directory.
 
-Genera el cliente Prisma y crea o actualiza la base local:
-
-```bash
-cd order-service
-npx prisma db push
-cd ..
-```
-
-`db push` sincroniza el esquema sin crear archivos de migración. Para un flujo de despliegue con historial y revisiones de esquema, configura migraciones versionadas antes de usar el proyecto en producción.
-
-## 🚀 Ejecución en desarrollo
-
-Abre una terminal para cada servicio. Los scripts `dev` usan `tsx watch`.
+In three terminals, from `apps/`:
 
 ```bash
 npm run dev --workspace=user-service
@@ -151,112 +239,58 @@ npm run dev --workspace=order-service
 ```
 
 ```bash
-npm run dev --workspace=notification-service
+npm exec --workspace=notification-service -- tsx src/index.ts
 ```
 
-`user-service` escucha en `0.0.0.0:50051`; `order-service` usa `PORT` (por defecto, `3000`). El consumidor y el productor se conectan al broker indicado por `RABBITMQ_URL`.
+`user-service` and `order-service` watch TypeScript through `tsx`. `notification-service` has no `dev` script; the `tsx` command above is the host equivalent. Production scripts in all three workspaces run `node dist/index.js` after `npm run build`.
 
-## 🧪 Pruebas y compilación
+`order-service` connects to RabbitMQ while the module graph loads. If `RABBITMQ_URL` is missing or the broker is down, that process exits before it listens.
 
-Ejecuta la prueba Jest disponible:
+### Tests and compile
 
 ```bash
+cd apps
 npm test --workspace=order-service
-```
-
-Compila los tres workspaces con TypeScript:
-
-```bash
 npm run build
 ```
 
-Los scripts de inicio de producción ejecutan `dist/index.js` dentro de cada workspace:
+The Jest test checks the shape of a sample order object. It does not boot Express, gRPC, Prisma, or RabbitMQ.
 
-```bash
-npm start --workspace=user-service
-npm start --workspace=order-service
-npm start --workspace=notification-service
-```
+### Exercise the flow
 
-Para `order-service`, prepara previamente `.env` y la base de datos. Para los tres servicios, asegúrate de que RabbitMQ esté accesible antes de iniciar los procesos.
-
-## 🌐 Prueba del flujo HTTP
-
-Crea una orden para el usuario mock `1`:
+Create an order for the mock user:
 
 ```bash
 curl -i -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
   -H "x-correlation-id: demo-order-001" \
-  -d '{
-    "userId": "1",
-    "productId": "prod-123",
-    "quantity": 2
-  }'
+  -d "{\"userId\":\"1\",\"productId\":\"prod-123\",\"quantity\":2}"
 ```
 
-La respuesta esperada es `201 Created`, incluye la orden persistida con su `id` generado y devuelve `x-correlation-id: demo-order-001`. El mismo identificador se propaga a los metadatos de gRPC, al evento RabbitMQ y a los logs que lo reciben.
+Expect `201`, a generated order `id`, and the response header `x-correlation-id: demo-order-001`. The same value is written to the gRPC metadata, the AMQP header, the `user-service` log, and the `notification-service` log.
 
-Prueba un usuario inexistente:
+Unknown user:
 
 ```bash
 curl -i -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
-  -d '{
-    "userId": "missing-user",
-    "productId": "prod-123",
-    "quantity": 1
-  }'
+  -d "{\"userId\":\"missing-user\",\"productId\":\"prod-123\",\"quantity\":1}"
 ```
 
-`user-service` responde `NOT_FOUND` y la API devuelve `404 User not found`; no se persiste ni publica esa orden.
+Expect `404` and no row or event. A body without a non-empty `userId`, a non-empty `productId`, and a positive integer `quantity` returns `400`.
 
-## ☠️ Dead Letter Queue
+Dead letter: open `http://localhost:15672` as `orders` / `orders`. Publish to the default exchange with routing key `orders` and a body that is not JSON, for example `{json-invalid`. The consumer logs the parse failure, rejects the delivery without requeue, and the message lands on `orders.dlq`.
 
-El consumidor rechaza sin reencolar un mensaje cuyo cuerpo no se puede interpretar como JSON. Para verificarlo en desarrollo:
+## Observability & Monitoring
 
-1. Abre la consola de administración de tu broker RabbitMQ.
-2. Publica en el exchange por defecto (`Default exchange`) con routing key `orders`.
-3. Usa un cuerpo inválido, por ejemplo:
+Correlation is the trace mechanism this repository implements. `order-service` reads `x-correlation-id` or generates a UUID, echoes it on the response, forwards it as gRPC metadata, and copies it onto the AMQP message header. `user-service` logs that metadata field with Pino (`name: "user-service"`) together with the requested user id. `notification-service` logs it with Pino (`name: "notification-service"`) together with the routing key and the parsed body.
 
-   ```text
-   {json-invalido
-   ```
+`order-service` itself logs with `console.info` and `console.error`. Its lines are not JSON and do not include the correlation id in the message body; the id is on the HTTP response and on the downstream calls.
 
-4. El consumidor registrará el fallo y ejecutará `nack` con `requeue=false`.
-5. Comprueba el mensaje en `orders.dlq` (a través del exchange `orders.dlx`).
+No service exports Prometheus metrics, OpenTelemetry spans, or a log shipping agent. Queue depth, consumer count, and dead-letter depth are visible in the RabbitMQ management UI on port `15672`. Compose health checks only tell you that the process is accepting connections (`user-service`, `order-service`, RabbitMQ) or that PID 1 is alive (`notification-service`). They do not measure error rate, and the Opossum breaker does not publish its open/half-open state anywhere.
 
-La DLQ almacena mensajes fallidos, pero este repositorio no incluye un consumidor para reprocesarlos ni una política de retención/alertas para esa cola.
-
-## 🐳 Ejecución con Docker Compose
-
-Compose construye los tres servicios y carga las variables de RabbitMQ desde `order-service/.env` y `notification-service/.env`. El broker **no** se ejecuta en Compose: debes proporcionar un RabbitMQ externo mediante `RABBITMQ_URL`.
+To follow one request, use the same `x-correlation-id` in the curl header and search for that string in the `user-service` and `notification-service` container logs:
 
 ```bash
-docker compose up --build
+docker compose logs -f user-service notification-service order-service
 ```
-
-La API queda disponible en `http://localhost:3000` y gRPC se publica en el puerto `50051`. Para cambiar el puerto HTTP publicado, define `ORDER_SERVICE_PORT` en el entorno desde el que ejecutas Compose; por defecto es `3000`.
-
-Para detener los servicios:
-
-```bash
-docker compose down
-```
-
-La base SQLite del contenedor vive en su sistema de archivos si no configuras un volumen. En consecuencia, los datos podrían perderse al recrear el contenedor. Configura almacenamiento persistente antes de usar Docker con datos que deban conservarse.
-
-## ⚠️ Limitaciones y siguientes pasos
-
-Este repositorio demuestra patrones de arquitectura, pero no afirma por sí solo tolerancia a fallos ni preparación de producción:
-
-- `user-service` usa un usuario mock en memoria; no hay almacenamiento ni gestión real de usuarios.
-- SQLite es apropiado para desarrollo o demostraciones, pero no resuelve por sí mismo alta disponibilidad, concurrencia distribuida ni backups de producción.
-- La persistencia de la orden y la publicación RabbitMQ son operaciones separadas. Si el publish falla después de guardar la orden, la API puede responder `503` aunque el registro ya exista. Un **transactional outbox** y un publicador idempotente ayudarían a evitar esa inconsistencia.
-- El circuito Opossum protege la llamada gRPC, pero no reemplaza health checks, políticas operativas, métricas ni alertas.
-- La DLQ captura mensajes rechazados; falta el proceso de inspección/reproceso y la política de retención.
-- Los tests existentes son básicos y no validan integraciones reales, concurrencia, reintentos, seguridad ni disponibilidad.
-- No hay autenticación/autorización de API, TLS configurado para gRPC, health checks de contenedor, gestión de secretos ni volumen SQLite en Compose.
-- El contrato actual de `order.created` es JSON publicado directamente en la cola `orders`; no incluye versionado de esquema ni un exchange dedicado para eventos de dominio.
-
-Para un despliegue real, añade pruebas de integración, telemetría y health checks, protección de datos y secretos, persistencia adecuada al entorno, migraciones Prisma y una estrategia transaccional para la publicación de eventos.

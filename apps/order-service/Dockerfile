@@ -17,6 +17,8 @@ RUN npm run build --workspace=order-service
 
 FROM node:20-alpine AS runtime
 
+RUN apk add --no-cache openssl su-exec
+
 ENV NODE_ENV=production
 WORKDIR /app
 
@@ -25,12 +27,16 @@ COPY user-service/package.json ./user-service/package.json
 COPY order-service/package.json ./order-service/package.json
 COPY notification-service/package.json ./notification-service/package.json
 COPY order-service/prisma ./order-service/prisma
-RUN npm ci --omit=dev --workspace=order-service && npm cache clean --force
+RUN npm ci --omit=dev --workspace=order-service \
+  && npm install --no-save --workspace=order-service prisma@5.22.0 \
+  && npm cache clean --force
 
 COPY --from=build --chown=node:node /app/node_modules/.prisma/client ./node_modules/.prisma/client
 COPY --from=build --chown=node:node /app/order-service/dist ./order-service/dist
 COPY --from=build --chown=node:node /app/proto ./proto
+COPY order-service/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+  && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER node
 EXPOSE 3000
-CMD ["node", "order-service/dist/index.js"]
+ENTRYPOINT ["sh", "/usr/local/bin/docker-entrypoint.sh"]

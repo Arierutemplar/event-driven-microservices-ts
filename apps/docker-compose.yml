@@ -1,31 +1,107 @@
+# Local stack for the apps/ npm workspace.
+# Build context is this directory: every Dockerfile copies the workspace root.
+# Credentials below are for a disposable local broker only.
+
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: orders
+      RABBITMQ_DEFAULT_PASS: orders
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - messaging
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
   user-service:
     build:
       context: .
       dockerfile: user-service/Dockerfile
     ports:
       - "50051:50051"
+    networks:
+      - service-mesh
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const net=require('net'); const socket=net.connect(50051,'127.0.0.1',()=>{socket.end();process.exit(0)}); socket.setTimeout(2000,()=>process.exit(1)); socket.on('error',()=>process.exit(1));"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   order-service:
     build:
       context: .
       dockerfile: order-service/Dockerfile
-    env_file:
-      - ./order-service/.env
     environment:
-      PORT: ${ORDER_SERVICE_PORT:-3000}
+      PORT: "3000"
       USER_SERVICE_URL: user-service:50051
+      RABBITMQ_URL: amqp://orders:orders@rabbitmq:5672
+      DATABASE_URL: file:/app/order-service/data/orders.db
     ports:
-      - "${ORDER_SERVICE_PORT:-3000}:${ORDER_SERVICE_PORT:-3000}"
+      - "${ORDER_SERVICE_PORT:-3000}:3000"
+    volumes:
+      - order-data:/app/order-service/data
+    networks:
+      - service-mesh
+      - messaging
     depends_on:
-      - user-service
+      rabbitmq:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const net=require('net'); const socket=net.connect(3000,'127.0.0.1',()=>{socket.end();process.exit(0)}); socket.setTimeout(2000,()=>process.exit(1)); socket.on('error',()=>process.exit(1));"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 25s
     restart: unless-stopped
 
   notification-service:
     build:
       context: .
       dockerfile: notification-service/Dockerfile
-    env_file:
-      - ./notification-service/.env
+    environment:
+      RABBITMQ_URL: amqp://orders:orders@rabbitmq:5672
+    networks:
+      - messaging
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.kill(1,0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
     restart: unless-stopped
+
+networks:
+  service-mesh:
+    driver: bridge
+  messaging:
+    driver: bridge
+
+volumes:
+  rabbitmq-data:
+  order-data:
