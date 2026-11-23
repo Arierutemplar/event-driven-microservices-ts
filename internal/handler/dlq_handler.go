@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 const (

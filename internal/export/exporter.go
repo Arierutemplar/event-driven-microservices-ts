@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 // Config del exportador. Los valores cero toman el valor por defecto.

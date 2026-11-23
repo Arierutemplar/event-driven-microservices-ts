@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/middleware"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/usecase"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/middleware"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/usecase"
 )
 
 const historyTimeout = 5 * time.Second
@@ -67,8 +67,9 @@ func (h *AnalyticsHandler) HandleIngest(w http.ResponseWriter, r *http.Request) 
 	event.TenantID = middleware.TenantFromContext(r.Context())
 
 	// Ingesta asíncrona mediante el canal concurrente
-	if err := h.service.IngestEvent(event); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	if err := h.service.IngestEventContext(r.Context(), event); err != nil {
+		slog.ErrorContext(r.Context(), "ingesta fallida", "request_id", middleware.RequestIDFromContext(r.Context()), "error", err)
+		http.Error(w, "Servicio de ingesta no disponible", http.StatusServiceUnavailable)
 		return
 	}
 	observability.RecordEventIngested(event.EventType)

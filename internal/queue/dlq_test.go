@@ -14,7 +14,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 // fakeRepo implementa domain.BatchEventRepository con un comportamiento configurable.

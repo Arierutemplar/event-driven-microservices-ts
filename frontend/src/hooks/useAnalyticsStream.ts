@@ -19,8 +19,8 @@ export interface AnalyticsStream {
 }
 
 /** Une conexión en tiempo real, resumen inicial, feed y rendimiento en una sola fuente de datos. */
-export function useAnalyticsStream(url: string): AnalyticsStream {
-  const { metrics: live, status, retries, reconnect } = useAnalyticsWebSocket(url);
+export function useAnalyticsStream(url: string, resolveUrl?: () => Promise<string>): AnalyticsStream {
+  const { metrics: live, status, retries, reconnect } = useAnalyticsWebSocket(url, resolveUrl);
   const initial = useInitialSummary();
 
   const metrics = live ?? initial;

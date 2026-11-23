@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 const (

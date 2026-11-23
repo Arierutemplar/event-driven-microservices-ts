@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 // Prueba de integración: requiere TEST_POSTGRES_DSN, p. ej.

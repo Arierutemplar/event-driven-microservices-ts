@@ -7,30 +7,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/dedup"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/transport"
 )
 
 var _ domain.EventPublisher = (*Client)(nil)
 
 // Config parametriza el stream, el consumer y el batching.
 type Config struct {
-	URL           string
-	Stream        string
-	Subject       string
-	Durable       string
-	BatchSize     int           // máximo de eventos por inserción
-	FlushInterval time.Duration // ventana máxima de espera para completar un lote
-	MaxDeliver    int           // intentos antes de enviar el mensaje a la DLQ (defecto 3)
-	DLQSubject    string        // subject de mensajes muertos (defecto analytics.dlq)
-	AckWait       time.Duration
-	RetryDelay    time.Duration // espera base antes de reentregar tras un Nak (crece con cada intento)
+	URL                                                 string
+	Stream                                              string
+	Subject                                             string
+	Durable                                             string
+	BatchSize                                           int           // máximo de eventos por inserción
+	FlushInterval                                       time.Duration // ventana máxima de espera para completar un lote
+	MaxDeliver                                          int           // intentos antes de enviar el mensaje a la DLQ (defecto 3)
+	DLQSubject                                          string        // subject de mensajes muertos (defecto analytics.dlq)
+	AckWait                                             time.Duration
+	RetryDelay                                          time.Duration // espera base antes de reentregar tras un Nak (crece con cada intento)
+	TLSCAFile, TLSCertFile, TLSKeyFile, CredentialsFile string
+	Replicas                                            int           // réplicas del stream (1 = sin HA; usar 3 en clúster)
+	MaxAge                                              time.Duration // retención máxima de mensajes sin procesar
 }
 
 func (c *Config) applyDefaults() {
@@ -76,6 +85,10 @@ type Client struct {
 	// Debe asignarse antes de RunConsumer.
 	OnDeadLetter func(reason string)
 
+	// Aggregate, si no es nil, se invoca tras persistir cada lote y antes del ack. Si devuelve
+	// error el lote se devuelve a la cola; debe ser idempotente por id de evento.
+	Aggregate func(ctx context.Context, events []*domain.Event) error
+
 	// Gate, si no es nil, se consulta antes de cada lectura: bloquea mientras el destino
 	// (p. ej. un circuit breaker abierto) no admita escrituras, pausando el consumo sin
 	// gastar entregas de los mensajes. Retorna error solo si ctx se cancela.
@@ -97,24 +110,35 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		nc  *nats.Conn
 		err error
 	)
+	opts := []nats.Option{
+		nats.Name("event-driven-microservices-ts"),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			slog.Warn("nats: desconectado", "error", err)
+		}),
+		nats.ReconnectHandler(func(c *nats.Conn) {
+			slog.Info("nats: reconectado")
+		}),
+	}
+	if cfg.TLSCAFile != "" || cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		tlsConfig, err := transport.ClientTLS(cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("queue: TLS: %w", err)
+		}
+		opts = append(opts, nats.Secure(tlsConfig))
+	}
+	if cfg.CredentialsFile != "" {
+		opts = append(opts, nats.UserCredentials(cfg.CredentialsFile))
+	}
 	for {
-		nc, err = nats.Connect(cfg.URL,
-			nats.Name("analytics-service"),
-			nats.MaxReconnects(-1),
-			nats.ReconnectWait(time.Second),
-			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-				slog.Warn("nats: desconectado", "error", err)
-			}),
-			nats.ReconnectHandler(func(c *nats.Conn) {
-				slog.Info("nats: reconectado", "url", c.ConnectedUrl())
-			}),
-		)
+		nc, err = nats.Connect(cfg.URL, opts...)
 		if err == nil {
 			break
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("queue: esperando NATS (%s): %w", cfg.URL, err)
+			return nil, fmt.Errorf("queue: esperando NATS: %w", err)
 		case <-time.After(time.Second):
 		}
 	}
@@ -125,12 +149,20 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("queue: jetstream: %w", err)
 	}
 
+	replicas, maxAge := cfg.Replicas, cfg.MaxAge
+	if replicas < 1 {
+		replicas = 1
+	}
+	if maxAge <= 0 {
+		maxAge = 72 * time.Hour
+	}
 	stream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      cfg.Stream,
 		Subjects:  []string{cfg.Subject},
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.WorkQueuePolicy,
-		MaxAge:    72 * time.Hour,
+		MaxAge:    maxAge,
+		Replicas:  replicas,
 		// Ventana de deduplicación por Nats-Msg-Id (reintentos de publicación)
 		Duplicates: 2 * time.Minute,
 	})
@@ -148,6 +180,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		Retention:  jetstream.LimitsPolicy,
 		MaxAge:     30 * 24 * time.Hour,
 		Duplicates: 2 * time.Minute,
+		Replicas:   replicas,
 	})
 	if err != nil {
 		nc.Close()
@@ -178,12 +211,15 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 // Publish serializa el evento y lo publica en el stream. Retorna nil solo tras
 // el ack de JetStream, así que un 202 al cliente implica mensaje durable.
 func (c *Client) Publish(ctx context.Context, e *domain.Event) error {
+	ctx, span := otel.Tracer("analytics/queue").Start(ctx, "nats publish", trace.WithSpanKind(trace.SpanKindProducer))
+	defer span.End()
 	data, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("queue: serializar evento: %w", err)
 	}
 
 	msg := &nats.Msg{Subject: c.cfg.Subject, Data: data, Header: nats.Header{}}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(http.Header(msg.Header)))
 	// Con id de evento, JetStream descarta reenvíos del mismo id dentro de la ventana
 	// de deduplicación (Duplicates). El id va acotado al tenant: así un tenant no puede
 	// suprimir eventos de otro reutilizando sus ids. Sin id se usa uno aleatorio.
@@ -195,6 +231,8 @@ func (c *Client) Publish(ctx context.Context, e *domain.Event) error {
 
 	ack, err := c.js.PublishMsg(ctx, msg)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
 		observability.NATSPublishError()
 		return fmt.Errorf("queue: publicar: %w", err)
 	}

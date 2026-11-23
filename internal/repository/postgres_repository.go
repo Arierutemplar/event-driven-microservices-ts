@@ -16,8 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 var (
@@ -30,22 +30,27 @@ var migrationsFS embed.FS
 
 // PostgresConfig agrupa los parámetros de conexión.
 type PostgresConfig struct {
-	Host     string
-	Port     string
-	User     string
-	Password string
-	DBName   string
-	SSLMode  string
+	Host        string
+	Port        string
+	User        string
+	Password    string
+	DBName      string
+	SSLMode     string
+	SSLRootCert string
 }
 
 // DSN construye la URL de conexión escapando credenciales.
 func (c PostgresConfig) DSN() string {
+	query := url.Values{"sslmode": {c.SSLMode}}
+	if c.SSLRootCert != "" {
+		query.Set("sslrootcert", c.SSLRootCert)
+	}
 	u := url.URL{
 		Scheme:   "postgres",
 		User:     url.UserPassword(c.User, c.Password),
 		Host:     c.Host + ":" + c.Port,
 		Path:     c.DBName,
-		RawQuery: url.Values{"sslmode": {c.SSLMode}}.Encode(),
+		RawQuery: query.Encode(),
 	}
 	return u.String()
 }

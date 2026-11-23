@@ -13,10 +13,10 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/repository"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/resilience"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/dedup"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/repository"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/resilience"
 )
 
 // pingRepo añade un Ping controlable a fakeRepo para ejercitar el breaker.
@@ -260,5 +260,30 @@ func TestTenantPropagatesThroughJetStreamAndIsolatesIDs(t *testing.T) {
 	}
 	if len(repo.saved) != 2 || got["tenant-a"] != 1 || got["tenant-b"] != 1 {
 		t.Fatalf("persistidos por tenant = %v (total %d), quería a:1 b:1", got, len(repo.saved))
+	}
+}
+
+// Si el agregado falla, el lote vuelve a la cola y se reintenta hasta contarse (sin ack previo).
+func TestAggregateFailureRedeliversBatch(t *testing.T) {
+	var calls atomic.Int32
+	counted := make(chan struct{}, 1)
+	c, _, _ := startManual(t, &fakeRepo{}, nil, func(c *Client) {
+		c.Aggregate = func(context.Context, []*domain.Event) error {
+			if calls.Add(1) == 1 {
+				return errors.New("redis caído")
+			}
+			select {
+			case counted <- struct{}{}:
+			default:
+			}
+			return nil
+		}
+	})
+	rawPublish(t, c, "agg-1")
+
+	select {
+	case <-counted:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("el agregado no se reintentó tras el fallo (llamadas=%d)", calls.Load())
 	}
 }

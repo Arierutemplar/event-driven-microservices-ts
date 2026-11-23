@@ -16,19 +16,24 @@ export interface AnalyticsWebSocket {
 /**
  * Mantiene una conexión WebSocket con reconexión automática (backoff exponencial
  * con jitter, tope de 30 s). Reconecta de inmediato al volver la red o la pestaña.
+ * Si se pasa `resolveUrl` (p. ej. para obtener un ticket efímero), se invoca antes de cada
+ * intento de conexión, de modo que cada reconexión usa credenciales nuevas.
  * Al desmontar o cambiar `url` se cancelan el temporizador, los listeners del
  * navegador y los handlers del socket, de modo que no quedan referencias vivas.
  */
-export function useAnalyticsWebSocket(url: string): AnalyticsWebSocket {
+export function useAnalyticsWebSocket(url: string, resolveUrl?: () => Promise<string>): AnalyticsWebSocket {
   const [metrics, setMetrics] = useState<MetricSummary | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [retries, setRetries] = useState(0);
 
   const reconnectNow = useRef<() => void>(() => undefined);
+  const resolveRef = useRef(resolveUrl);
+  resolveRef.current = resolveUrl;
 
   useEffect(() => {
     let disposed = false;
     let socket: WebSocket | null = null;
+    let resolving = false;
     let timer: number | undefined;
     let attempt = 0;
 
@@ -39,12 +44,16 @@ export function useAnalyticsWebSocket(url: string): AnalyticsWebSocket {
       ws.onclose = null;
     };
 
-    const connect = () => {
-      window.clearTimeout(timer);
-      if (disposed || (socket && socket.readyState <= WebSocket.OPEN)) return;
+    const scheduleRetry = () => {
+      setStatus("disconnected");
+      const base = Math.min(INITIAL_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+      attempt += 1;
+      setRetries(attempt);
+      timer = window.setTimeout(connect, base * (0.75 + Math.random() * 0.5));
+    };
 
-      setStatus("connecting");
-      const ws = new WebSocket(url);
+    const open = (target: string) => {
+      const ws = new WebSocket(target);
       socket = ws;
 
       ws.onopen = () => {
@@ -64,16 +73,35 @@ export function useAnalyticsWebSocket(url: string): AnalyticsWebSocket {
         if (socket !== ws) return; // socket obsoleto, ya reemplazado
         socket = null;
         if (disposed) return;
-        setStatus("disconnected");
-        const base = Math.min(INITIAL_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
-        attempt += 1;
-        setRetries(attempt);
-        timer = window.setTimeout(connect, base * (0.75 + Math.random() * 0.5));
+        scheduleRetry();
       };
     };
 
+    function connect() {
+      window.clearTimeout(timer);
+      if (disposed || resolving || (socket && socket.readyState <= WebSocket.OPEN)) return;
+
+      setStatus("connecting");
+      const resolver = resolveRef.current;
+      if (!resolver) {
+        open(url);
+        return;
+      }
+      resolving = true;
+      resolver().then(
+        (target) => {
+          resolving = false;
+          if (!disposed && !socket) open(target);
+        },
+        () => {
+          resolving = false;
+          if (!disposed) scheduleRetry();
+        },
+      );
+    }
+
     const wake = () => {
-      if (document.visibilityState === "visible" && !socket) {
+      if (document.visibilityState === "visible" && !socket && !resolving) {
         attempt = 0;
         connect();
       }

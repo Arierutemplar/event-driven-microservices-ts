@@ -12,7 +12,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 type fakeSource struct {

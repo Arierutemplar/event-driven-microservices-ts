@@ -10,7 +10,7 @@ import (
 
 	"github.com/sony/gobreaker/v2"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 // ErrOpen indica que la operación se rechazó sin ejecutarse porque el circuito está abierto.

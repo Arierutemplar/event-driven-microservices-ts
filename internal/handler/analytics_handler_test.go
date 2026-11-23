@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/middleware"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/usecase"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/middleware"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/usecase"
 )
 
 type captureRepo struct{ got chan *domain.Event }

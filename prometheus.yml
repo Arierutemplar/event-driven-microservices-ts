@@ -4,11 +4,18 @@ global:
 rule_files:
   - /etc/prometheus/prometheus-rules.yml
 
+# Alertmanager opcional en Compose (`docker compose --profile alerting up -d`). En
+# producción apunta a tu Alertmanager gestionado o al Service del clúster.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: analytics-backend
     metrics_path: /metrics
     authorization:
       type: Bearer
-      credentials: ${PROMETHEUS_API_KEY}
+      credentials_file: /tmp/analytics_metrics_key
     static_configs:
       - targets: ["backend:8080"]

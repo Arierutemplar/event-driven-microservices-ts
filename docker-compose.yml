@@ -23,7 +23,7 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       POSTGRES_DB: analytics
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -75,24 +75,40 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Vacío = sin autenticación. Si defines API_KEY, Prometheus no podrá
-      # hacer scrape de /metrics sin configurar la cabecera X-API-Key.
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      # Valores por defecto exclusivamente para desarrollo.
       API_KEY: ${API_KEY:-}
+      API_KEY_FILE: ${API_KEY_FILE:-}
       # Claves por tenant: "clave1:tenantA,clave2:tenantB" (vacío = solo API_KEY / sin auth)
       TENANT_API_KEYS: ${TENANT_API_KEYS:-}
-      # Token de solo lectura para /ws (además de API_KEY); apto para el navegador
+      TENANT_API_KEYS_FILE: ${TENANT_API_KEYS_FILE:-}
+      # Legado / solo desarrollo: token estático global para /ws. Producción: WS_AUTH_MODE=ticket + WS_TICKET_SECRET
       WS_TOKEN: ${WS_TOKEN:-}
+      WS_TOKEN_FILE: ${WS_TOKEN_FILE:-}
+      WS_TICKET_SECRET: ${WS_TICKET_SECRET:-}
+      WS_TICKET_SECRET_FILE: ${WS_TICKET_SECRET_FILE:-}
+      WS_AUTH_MODE: ${WS_AUTH_MODE:-any}
+      WS_TICKET_TTL: ${WS_TICKET_TTL:-30s}
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-20}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-40}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD-postgres}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE:-}
+      POSTGRES_SSLROOTCERT: ${POSTGRES_SSLROOTCERT:-}
       POSTGRES_DB: analytics
       POSTGRES_SSLMODE: disable
-      NATS_URL: nats://nats:4222
+      NATS_URL: ${NATS_URL-nats://nats:4222}
+      NATS_URL_FILE: ${NATS_URL_FILE:-}
+      NATS_TLS_CA_FILE: ${NATS_TLS_CA_FILE:-}
+      NATS_TLS_CERT_FILE: ${NATS_TLS_CERT_FILE:-}
+      NATS_TLS_KEY_FILE: ${NATS_TLS_KEY_FILE:-}
+      NATS_CREDS_FILE: ${NATS_CREDS_FILE:-}
       NATS_STREAM: EVENTS
       NATS_MAX_DELIVER: ${NATS_MAX_DELIVER:-3}
+      NATS_STREAM_REPLICAS: ${NATS_STREAM_REPLICAS:-1}
+      NATS_STREAM_MAX_AGE: ${NATS_STREAM_MAX_AGE:-72h}
       NATS_DLQ_SUBJECT: analytics.dlq
       BATCH_SIZE: ${BATCH_SIZE:-500}
       BATCH_FLUSH_INTERVAL: ${BATCH_FLUSH_INTERVAL:-1s}
@@ -102,20 +118,37 @@ services:
       DEDUP_TTL: ${DEDUP_TTL:-10m}
       DEDUP_MAX_ENTRIES: ${DEDUP_MAX_ENTRIES:-100000}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-25s}
-      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/0}
+      REDIS_URL: ${REDIS_URL-redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/0}
+      REDIS_URL_FILE: ${REDIS_URL_FILE:-}
       REDIS_PREFIX: ${REDIS_PREFIX:-analytics}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_TLS_CERT_FILE: ${REDIS_TLS_CERT_FILE:-}
+      REDIS_TLS_KEY_FILE: ${REDIS_TLS_KEY_FILE:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: ${LOG_FORMAT:-text}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
       WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-*}
+      TLS_CERT_FILE: ${TLS_CERT_FILE:-}
+      TLS_KEY_FILE: ${TLS_KEY_FILE:-}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      OTEL_TRACING_ENABLED: ${OTEL_TRACING_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_EXPORTER_OTLP_HEADERS_FILE: ${OTEL_EXPORTER_OTLP_HEADERS_FILE:-}
       # Data lake: exportación periódica a Parquet (vacío S3_ENDPOINT = desactivada).
       # Las credenciales por defecto son solo de desarrollo: define S3_ACCESS_KEY/S3_SECRET_KEY reales.
       S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY-minioadmin}
+      S3_ACCESS_KEY_FILE: ${S3_ACCESS_KEY_FILE:-}
+      S3_SECRET_KEY_FILE: ${S3_SECRET_KEY_FILE:-}
       S3_BUCKET: ${S3_BUCKET:-analytics-lake}
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_USE_SSL: ${S3_USE_SSL:-false}
+      S3_TLS_CA_FILE: ${S3_TLS_CA_FILE:-}
+      S3_TLS_CERT_FILE: ${S3_TLS_CERT_FILE:-}
+      S3_TLS_KEY_FILE: ${S3_TLS_KEY_FILE:-}
       S3_PREFIX: ${S3_PREFIX:-}
       EXPORT_INTERVAL: ${EXPORT_INTERVAL:-5m}
       EXPORT_BATCH_SIZE: ${EXPORT_BATCH_SIZE:-50000}
@@ -142,12 +175,21 @@ services:
     build:
       context: ./frontend
       args:
-        # Se incrustan en el bundle (públicos): usa WS_TOKEN y una clave de tenant, no la de administración
+        # Se incrustan en el bundle (públicos). VITE_WS_TOKEN es legado (solo desarrollo); en
+        # producción usa FRONTEND_WS_TICKET_URL y nunca la clave de administración.
         VITE_WS_TOKEN: ${WS_TOKEN:-}
         VITE_INGEST_API_KEY: ${FRONTEND_INGEST_KEY:-}
         VITE_TENANT_ID: ${FRONTEND_TENANT_ID:-}
+        VITE_API_URL: ${FRONTEND_API_URL:-http://localhost:8080}
+        VITE_WS_URL: ${FRONTEND_WS_URL:-ws://localhost:8080/ws}
+        VITE_WS_TICKET_URL: ${FRONTEND_WS_TICKET_URL:-}
     ports:
-      - "80:80"
+      - "80:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     depends_on:
       backend:
         condition: service_healthy
@@ -155,9 +197,16 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--config.expand-env"
+      - |
+        umask 077
+        if [ -n "$$PROMETHEUS_API_KEY_FILE" ]; then
+          cat "$$PROMETHEUS_API_KEY_FILE" > /tmp/analytics_metrics_key
+        else
+          printf '%s' "$$PROMETHEUS_API_KEY" > /tmp/analytics_metrics_key
+        fi
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
     ports:
       - "9091:9090"
     volumes:
@@ -165,7 +214,8 @@ services:
       - ./prometheus-rules.yml:/etc/prometheus/prometheus-rules.yml:ro
       - prometheus-data:/prometheus
     environment:
-      PROMETHEUS_API_KEY: ${API_KEY:-}
+      PROMETHEUS_API_KEY: ${PROMETHEUS_API_KEY-${API_KEY:-}}
+      PROMETHEUS_API_KEY_FILE: ${PROMETHEUS_API_KEY_FILE:-}
     depends_on:
       backend:
         condition: service_healthy
@@ -184,6 +234,18 @@ services:
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
+    restart: unless-stopped
+
+  # Opcional: `docker compose --profile alerting up -d`. Sin integraciones configuradas
+  # las alertas solo se ven en la UI (http://localhost:9093).
+  alertmanager:
+    image: prom/alertmanager:latest
+    profiles: ["alerting"]
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.example.yml:/etc/alertmanager/alertmanager.yml:ro
     restart: unless-stopped
 
 volumes:

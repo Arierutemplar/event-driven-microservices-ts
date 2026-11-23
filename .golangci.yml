@@ -1,0 +1,11 @@
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      # Deferred Close/Rollback in tests: a failure there does not change the test outcome.
+      - path: _test\.go
+        linters:
+          - errcheck

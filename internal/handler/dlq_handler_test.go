@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/middleware"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/middleware"
 )
 
 type fakeDLQ struct {

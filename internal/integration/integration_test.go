@@ -31,11 +31,11 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/handler"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/queue"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/repository"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/usecase"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/handler"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/queue"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/repository"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/usecase"
 )
 
 // ---------------------------------------------------------------------------

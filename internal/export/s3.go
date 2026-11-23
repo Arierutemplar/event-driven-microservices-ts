@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/transport"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -20,12 +21,13 @@ type ObjectStore interface {
 
 // S3Config configura la conexión a un servicio compatible con S3.
 type S3Config struct {
-	Endpoint  string // host:puerto, sin esquema
-	AccessKey string
-	SecretKey string
-	Bucket    string
-	Region    string
-	UseSSL    bool
+	Endpoint                           string // host:puerto, sin esquema
+	AccessKey                          string
+	SecretKey                          string
+	Bucket                             string
+	Region                             string
+	UseSSL                             bool
+	TLSCAFile, TLSCertFile, TLSKeyFile string
 }
 
 // S3Store implementa ObjectStore con minio-go (compatible con AWS S3 y MinIO).
@@ -38,11 +40,27 @@ func NewS3Store(cfg S3Config) (*S3Store, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" {
 		return nil, fmt.Errorf("export: S3 requiere endpoint y bucket")
 	}
-	c, err := minio.New(cfg.Endpoint, &minio.Options{
+	opts := &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 		Secure: cfg.UseSSL,
 		Region: cfg.Region,
-	})
+	}
+	if cfg.TLSCAFile != "" || cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		if !cfg.UseSSL {
+			return nil, fmt.Errorf("export: TLS files require S3_USE_SSL")
+		}
+		tlsConfig, err := transport.ClientTLS(cfg.TLSCAFile, cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("export: TLS: %w", err)
+		}
+		tr, err := minio.DefaultTransport(true)
+		if err != nil {
+			return nil, fmt.Errorf("export: transport: %w", err)
+		}
+		tr.TLSClientConfig = tlsConfig
+		opts.Transport = tr
+	}
+	c, err := minio.New(cfg.Endpoint, opts)
 	if err != nil {
 		return nil, fmt.Errorf("export: cliente S3: %w", err)
 	}

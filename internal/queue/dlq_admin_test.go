@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 // poisonRepo falla de forma permanente con los eventos "poison*" hasta que se marca como arreglado.

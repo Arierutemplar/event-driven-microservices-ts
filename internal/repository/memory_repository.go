@@ -8,7 +8,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 var _ domain.EventRepository = (*MemoryRepository)(nil)

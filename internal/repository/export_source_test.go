@@ -137,3 +137,51 @@ func TestPostgresExportLockIsExclusive(t *testing.T) {
 	}
 	rel2()
 }
+
+// Una transacción abierta con un id menor no debe quedar atrás cuando otra posterior confirma.
+func TestPostgresExportPlanWaitsForInFlightWriter(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN no definido")
+	}
+	ctx := context.Background()
+	repo, err := NewPostgresRepository(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	src := repo.ExportSource()
+	tenant := fmt.Sprintf("inflight-%d", time.Now().UnixNano())
+
+	var base int64
+	_ = repo.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&base)
+
+	open, err := repo.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer open.Rollback(ctx)
+	if _, err := open.Exec(ctx, `INSERT INTO events (event_id, tenant_id, event_type, user_id) VALUES ('slow', $1, 'click', 'u')`, tenant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.pool.Exec(ctx, `INSERT INTO events (event_id, tenant_id, event_type, user_id) VALUES ('fast', $1, 'click', 'u')`, tenant); err != nil {
+		t.Fatal(err)
+	}
+
+	upTo, n, err := src.Plan(ctx, base, time.Now().Add(time.Minute), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fastID int64
+	_ = repo.pool.QueryRow(ctx, `SELECT id FROM events WHERE event_id='fast' AND tenant_id=$1`, tenant).Scan(&fastID)
+	if n != 0 && upTo >= fastID {
+		t.Fatalf("Plan exportó id %d con una transacción anterior sin confirmar (upTo=%d)", fastID, upTo)
+	}
+
+	if err := open.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, n, err := src.Plan(ctx, base, time.Now().Add(time.Minute), 100); err != nil || n < 2 {
+		t.Fatalf("tras confirmar deben ser elegibles ambas filas: n=%d err=%v", n, err)
+	}
+}

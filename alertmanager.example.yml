@@ -1,0 +1,63 @@
+# Ejemplo de Alertmanager para event-driven-microservices-ts.
+#
+# Desarrollo: `docker compose --profile alerting up -d` monta este archivo tal cual. Sin
+# integraciones configuradas los receptores descartan las alertas (visibles en
+# http://localhost:9093), lo que permite comprobar rutas e inhibiciones sin enviar nada.
+#
+# Producción: copia el archivo, descomenta la integración de tu proveedor y lee los
+# secretos desde archivos montados (`*_file`), nunca en texto plano en el repositorio.
+# Monta el resultado con un Secret de Kubernetes, Vault Agent o ESO.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: platform-default
+  group_by: ["alertname", "slo"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Pérdida de eventos o presupuesto de error agotándose rápido: guardia inmediata.
+    - receiver: platform-pager
+      matchers:
+        - severity="critical"
+      group_wait: 10s
+      repeat_interval: 1h
+    - receiver: platform-default
+      matchers:
+        - severity="warning"
+
+inhibit_rules:
+  # Si el backend no responde a Prometheus, no notificar los síntomas derivados.
+  - source_matchers:
+      - alertname="AnalyticsTargetDown"
+    target_matchers:
+      - severity="warning"
+  # El fast burn ya pagina; el slow burn sería redundante.
+  - source_matchers:
+      - alertname="AnalyticsAvailabilityFastBurn"
+    target_matchers:
+      - alertname="AnalyticsAvailabilitySlowBurn"
+
+receivers:
+  - name: platform-default
+    # slack_configs:
+    #   - api_url_file: /etc/alertmanager/secrets/slack_webhook_url
+    #     channel: "#analytics-alerts"
+    #     send_resolved: true
+    # email_configs:
+    #   - to: analytics-oncall@example.com
+    #     from: alertmanager@example.com
+    #     smarthost: smtp.example.com:587
+    #     auth_username: alertmanager@example.com
+    #     auth_password_file: /etc/alertmanager/secrets/smtp_password
+
+  - name: platform-pager
+    # pagerduty_configs:
+    #   - routing_key_file: /etc/alertmanager/secrets/pagerduty_routing_key
+    #     send_resolved: true
+    # opsgenie_configs:
+    #   - api_key_file: /etc/alertmanager/secrets/opsgenie_api_key
+    # webhook_configs:
+    #   - url_file: /etc/alertmanager/secrets/incident_webhook_url
+    #     send_resolved: true

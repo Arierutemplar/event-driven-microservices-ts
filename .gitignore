@@ -7,3 +7,5 @@ dist/
 coverage/
 .env.local
 .env.*.local
+# Secretos locales de Compose (usa .env.example como plantilla)
+/.env

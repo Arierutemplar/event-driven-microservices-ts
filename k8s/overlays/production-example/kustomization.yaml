@@ -1,0 +1,58 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Starting point for a real cluster using External Secrets Operator. Copy this directory,
+# then change ONLY the values marked CHANGE. `namespace:` rewrites every resource (base, ESO
+# objects, service accounts), so renaming the namespace is a one-line change.
+# Vault Agent alternative: use ../../vault-agent instead of ../../eso as a base.
+namespace: analytics-prod # CHANGE
+resources:
+  - ../../base
+  - ../../eso
+images:
+  - name: ghcr.io/arierutemplar/event-driven-microservices-ts
+    newName: ghcr.io/arierutemplar/event-driven-microservices-ts # CHANGE
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000 # CHANGE (immutable digest)
+patches:
+  - target:
+      kind: ConfigMap
+      name: analytics-config
+    patch: |-
+      - op: replace
+        path: /data/CORS_ALLOWED_ORIGINS
+        value: https://analytics.example.com # CHANGE
+      - op: replace
+        path: /data/WS_ALLOWED_ORIGINS
+        value: https://analytics.example.com # CHANGE
+      - op: replace
+        path: /data/TRUSTED_PROXY_CIDRS
+        value: 10.42.0.0/16 # CHANGE: real ingress-controller source CIDRs
+      - op: add
+        path: /data/POSTGRES_HOST
+        value: postgres.example.internal # CHANGE
+      - op: add
+        path: /data/POSTGRES_USER
+        value: analytics # CHANGE
+      - op: add
+        path: /data/POSTGRES_DB
+        value: analytics # CHANGE
+  # Namespaces allowed to reach the backend (ingress controller, Prometheus).
+  - target:
+      kind: NetworkPolicy
+      name: analytics-backend-ingress
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: ingress-nginx # CHANGE
+      - op: replace
+        path: /spec/ingress/0/from/1/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: monitoring # CHANGE
+  # Restrict egress to your datastore namespaces/CIDRs instead of "any destination on port X".
+  - target:
+      kind: NetworkPolicy
+      name: analytics-backend-egress
+    patch: |-
+      - op: add
+        path: /spec/egress/1/to
+        value:
+          - ipBlock:
+              cidr: 10.0.0.0/8 # CHANGE

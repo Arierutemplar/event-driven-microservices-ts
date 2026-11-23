@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 // setupLogger configura el logger global a partir de LOG_LEVEL (debug|info|warn|error, por
@@ -29,7 +31,7 @@ func setupLogger() {
 	if strings.EqualFold(os.Getenv("LOG_FORMAT"), "json") {
 		h = slog.NewJSONHandler(os.Stdout, opts)
 	}
-	slog.SetDefault(slog.New(h))
+	slog.SetDefault(slog.New(observability.ContextHandler{Handler: h}))
 
 	if invalid {
 		slog.Warn("LOG_LEVEL inválido, usando info", "valor", os.Getenv("LOG_LEVEL"))

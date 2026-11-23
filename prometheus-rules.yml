@@ -1,5 +1,117 @@
+# SLO definidos en docs/slo.md. Disponibilidad 99 % (presupuesto de error 1 %),
+# latencia p95 < 200 ms en POST /api/events y pérdida de eventos < 0,1 %.
 groups:
-  - name: analytics-service
+  - name: analytics-slo-recording
+    interval: 30s
+    rules:
+      # Ratio de errores 5xx en la ingesta para cada ventana de burn-rate.
+      - record: analytics:ingest_error_ratio:rate5m
+        expr: |
+          sum(rate(analytics_http_requests_total{path="/api/events",code=~"5.."}[5m]))
+          / clamp_min(sum(rate(analytics_http_requests_total{path="/api/events"}[5m])), 1e-9)
+      - record: analytics:ingest_error_ratio:rate30m
+        expr: |
+          sum(rate(analytics_http_requests_total{path="/api/events",code=~"5.."}[30m]))
+          / clamp_min(sum(rate(analytics_http_requests_total{path="/api/events"}[30m])), 1e-9)
+      - record: analytics:ingest_error_ratio:rate1h
+        expr: |
+          sum(rate(analytics_http_requests_total{path="/api/events",code=~"5.."}[1h]))
+          / clamp_min(sum(rate(analytics_http_requests_total{path="/api/events"}[1h])), 1e-9)
+      - record: analytics:ingest_error_ratio:rate6h
+        expr: |
+          sum(rate(analytics_http_requests_total{path="/api/events",code=~"5.."}[6h]))
+          / clamp_min(sum(rate(analytics_http_requests_total{path="/api/events"}[6h])), 1e-9)
+      - record: analytics:ingest_availability:ratio_rate30d
+        expr: |
+          1 - (
+            sum(increase(analytics_http_requests_total{path="/api/events",code=~"5.."}[30d]))
+            / clamp_min(sum(increase(analytics_http_requests_total{path="/api/events"}[30d])), 1e-9)
+          )
+
+      - record: analytics:ingest_latency_p95_seconds:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(analytics_http_request_duration_seconds_bucket{path="/api/events",method="POST"}[5m])))
+
+      # Eventos publicados en JetStream que no se explican por consumo, DLQ, duplicados
+      # descartados en el consumer ni crecimiento del backlog. Los gauges del stream son
+      # iguales en todas las réplicas, por eso se usa max().
+      - record: analytics:events_unaccounted:increase30m
+        expr: |
+          sum(increase(analytics_nats_published_total[30m]))
+          - sum(increase(analytics_nats_consumed_total[30m]))
+          - (sum(increase(analytics_dlq_messages_total[30m])) or vector(0))
+          - (sum(increase(analytics_dedup_dropped_total{stage="consumer"}[30m])) or vector(0))
+          - max(delta(analytics_nats_pending_messages[30m]))
+          - max(delta(analytics_nats_ack_pending_messages[30m]))
+      - record: analytics:event_loss_ratio:increase30m
+        expr: |
+          clamp_min(analytics:events_unaccounted:increase30m, 0)
+          / clamp_min(sum(increase(analytics_nats_published_total[30m])), 1)
+
+  - name: analytics-slo-alerts
+    rules:
+      # Burn-rate multiventana (Google SRE workbook): 14.4x agota el 2 % del presupuesto
+      # mensual en 1 h; 6x agota el 5 % en 6 h.
+      - alert: AnalyticsAvailabilityFastBurn
+        expr: |
+          analytics:ingest_error_ratio:rate1h > (14.4 * 0.01)
+          and analytics:ingest_error_ratio:rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "La ingesta consume el presupuesto de error 14.4x más rápido de lo permitido"
+          description: "Errores 5xx en /api/events: {{ $value | humanizePercentage }} (1h)."
+          runbook: "docs/slo.md"
+
+      - alert: AnalyticsAvailabilitySlowBurn
+        expr: |
+          analytics:ingest_error_ratio:rate6h > (6 * 0.01)
+          and analytics:ingest_error_ratio:rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "La ingesta consume el presupuesto de error 6x más rápido de lo permitido"
+          runbook: "docs/slo.md"
+
+      - alert: AnalyticsIngestLatencyHigh
+        expr: analytics:ingest_latency_p95_seconds:rate5m > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "p95 de POST /api/events por encima de 200 ms"
+          description: "p95 actual: {{ $value | humanizeDuration }}."
+          runbook: "docs/slo.md"
+
+      - alert: AnalyticsEventLossSuspected
+        expr: |
+          analytics:event_loss_ratio:increase30m > 0.001
+          and sum(increase(analytics_nats_published_total[30m])) > 100
+        for: 15m
+        labels:
+          severity: critical
+          slo: event-loss
+        annotations:
+          summary: "Más del 0,1 % de los eventos publicados no aparece como consumido, en DLQ ni en backlog"
+          runbook: "docs/slo.md"
+
+      - alert: AnalyticsDLQPublishFailing
+        expr: sum(increase(analytics_dlq_publish_errors_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: event-loss
+        annotations:
+          summary: "No se pueden publicar mensajes en la DLQ; los mensajes fallidos se reintentan sin poder aislarse"
+          runbook: "docs/runbooks/dlq.md"
+
+  - name: event-driven-microservices-ts
     rules:
       - alert: AnalyticsHighHTTPErrorRate
         expr: |
@@ -13,6 +125,15 @@ groups:
           summary: "Analytics HTTP 5xx rate above 1%"
           runbook: "docs/runbooks/service-overview.md"
 
+      - alert: AnalyticsTargetDown
+        expr: up{job="analytics-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus no puede hacer scrape de una réplica del backend"
+          runbook: "docs/runbooks/service-overview.md"
+
       - alert: AnalyticsDLQBacklog
         expr: analytics_dlq_depth > 100
         for: 10m
@@ -23,7 +144,7 @@ groups:
           runbook: "docs/runbooks/dlq.md"
 
       - alert: AnalyticsNATSBacklog
-        expr: analytics_nats_pending_messages > 10000
+        expr: max(analytics_nats_pending_messages) > 10000
         for: 10m
         labels:
           severity: warning
@@ -40,8 +161,12 @@ groups:
           summary: "Analytics PostgreSQL circuit breaker is open"
           runbook: "docs/runbooks/database.md"
 
+      # Solo réplicas que alguna vez exportaron (timestamp > 0); las que no exportan
+      # (lock distribuido) o con exportación desactivada no disparan la alerta.
       - alert: AnalyticsExporterStalled
-        expr: time() - analytics_parquet_last_success_timestamp_seconds > 3600
+        expr: |
+          max(analytics_parquet_last_success_timestamp_seconds) > 0
+          and time() - max(analytics_parquet_last_success_timestamp_seconds) > 3600
         for: 15m
         labels:
           severity: warning

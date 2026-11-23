@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-backend
+  namespace: analytics
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-inject-token: "false"
+        vault.hashicorp.com/agent-run-as-user: "10001"
+        vault.hashicorp.com/agent-run-as-group: "10001"
+        vault.hashicorp.com/agent-service-account-token-volume-name: vault-auth-token
+        vault.hashicorp.com/service: https://vault.example.com:8200
+        vault.hashicorp.com/role: analytics-agent
+        vault.hashicorp.com/agent-inject-secret-api-key: kv/data/analytics/backend
+        vault.hashicorp.com/agent-inject-template-api-key: '{{- with secret "kv/data/analytics/backend" -}}{{ .Data.data.api_key }}{{- end -}}'
+        vault.hashicorp.com/error-on-missing-key-api-key: "true"
+        vault.hashicorp.com/agent-inject-perms-api-key: "0400"
+        vault.hashicorp.com/agent-inject-secret-ws-ticket-secret: kv/data/analytics/backend
+        vault.hashicorp.com/agent-inject-template-ws-ticket-secret: '{{- with secret "kv/data/analytics/backend" -}}{{ .Data.data.ws_ticket_secret }}{{- end -}}'
+        vault.hashicorp.com/error-on-missing-key-ws-ticket-secret: "true"
+        vault.hashicorp.com/agent-inject-perms-ws-ticket-secret: "0400"
+        vault.hashicorp.com/agent-inject-secret-postgres-password: kv/data/analytics/backend
+        vault.hashicorp.com/agent-inject-template-postgres-password: '{{- with secret "kv/data/analytics/backend" -}}{{ .Data.data.postgres_password }}{{- end -}}'
+        vault.hashicorp.com/error-on-missing-key-postgres-password: "true"
+        vault.hashicorp.com/agent-inject-perms-postgres-password: "0400"
+        vault.hashicorp.com/agent-inject-secret-nats-url: kv/data/analytics/backend
+        vault.hashicorp.com/agent-inject-template-nats-url: '{{- with secret "kv/data/analytics/backend" -}}{{ .Data.data.nats_url }}{{- end -}}'
+        vault.hashicorp.com/error-on-missing-key-nats-url: "true"
+        vault.hashicorp.com/agent-inject-perms-nats-url: "0400"
+        vault.hashicorp.com/agent-inject-secret-redis-url: kv/data/analytics/backend
+        vault.hashicorp.com/agent-inject-template-redis-url: '{{- with secret "kv/data/analytics/backend" -}}{{ .Data.data.redis_url }}{{- end -}}'
+        vault.hashicorp.com/error-on-missing-key-redis-url: "true"
+        vault.hashicorp.com/agent-inject-perms-redis-url: "0400"
+    spec:
+      serviceAccountName: analytics-vault-agent
+      automountServiceAccountToken: false
+      volumes:
+        - name: vault-auth-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: vault
+                  expirationSeconds: 3600
+      containers:
+        - name: backend
+          env:
+            - name: API_KEY_FILE
+              value: /vault/secrets/api-key
+            - name: WS_TICKET_SECRET_FILE
+              value: /vault/secrets/ws-ticket-secret
+            - name: POSTGRES_PASSWORD_FILE
+              value: /vault/secrets/postgres-password
+            - name: NATS_URL_FILE
+              value: /vault/secrets/nats-url
+            - name: REDIS_URL_FILE
+              value: /vault/secrets/redis-url

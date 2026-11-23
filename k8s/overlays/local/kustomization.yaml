@@ -1,0 +1,80 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Overlay for kind / k3d / minikube. Brings its own PostgreSQL, Redis and NATS (single
+# instance, emptyDir: NOT durable) and a Secret with obviously fake development values.
+#
+#   docker build -t event-driven-microservices-ts:local .
+#   kind load docker-image event-driven-microservices-ts:local        # k3d: k3d image import event-driven-microservices-ts:local
+#   kubectl apply -k k8s/overlays/local
+#   kubectl -n analytics port-forward svc/analytics-backend 8080:8080
+resources:
+  - ../../base
+  - dependencies.yaml
+  - secret.local.yaml
+images:
+  - name: ghcr.io/arierutemplar/event-driven-microservices-ts
+    newName: event-driven-microservices-ts
+    newTag: local
+patches:
+  - target:
+      kind: ConfigMap
+      name: analytics-config
+    patch: |-
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: development
+      - op: replace
+        path: /data/POSTGRES_SSLMODE
+        value: disable
+      - op: replace
+        path: /data/CORS_ALLOWED_ORIGINS
+        value: http://localhost:5173
+      - op: replace
+        path: /data/WS_ALLOWED_ORIGINS
+        value: http://localhost:5173
+      - op: replace
+        path: /data/NATS_STREAM_REPLICAS
+        value: "1"
+      - op: add
+        path: /data/POSTGRES_HOST
+        value: postgres
+      - op: add
+        path: /data/POSTGRES_USER
+        value: postgres
+      - op: add
+        path: /data/POSTGRES_DB
+        value: analytics
+  # The bundled PostgreSQL/Redis/NATS images run as root: relax Pod Security to baseline locally.
+  - target:
+      kind: Namespace
+      name: analytics
+    patch: |-
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1enforce
+        value: baseline
+  - target:
+      kind: Deployment
+      name: analytics-backend
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  # A single-replica PDB blocks node drains and the HPA fights the fixed replica count.
+  - target:
+      kind: PodDisruptionBudget
+      name: analytics-backend
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: analytics-backend
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: analytics-backend
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: analytics-backend

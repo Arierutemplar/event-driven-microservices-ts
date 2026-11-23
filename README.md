@@ -4,13 +4,13 @@ Plataforma de analíticas de eventos en tiempo real. Una API en Go recibe evento
 
 ## Enterprise baseline
 
-- Redis comparte el resumen de métricas y el rate limiting entre réplicas cuando `REDIS_URL` está definido.
-- Producción exige PostgreSQL, NATS, Redis y autenticación; CORS/WebSocket no permiten `*`.
+- Redis comparte el resumen de métricas y el rate limiting entre réplicas cuando `REDIS_URL` está definido. El resumen no es una agregación transaccional ni garantiza exactitud ante fallos.
+- Producción exige credenciales, PostgreSQL, NATS, Redis y transporte seguro; los orígenes deben ser HTTPS explícitos.
 - Las migraciones quedan registradas en `schema_migrations`; los duplicados históricos se archivan antes de aplicar unicidad.
 - Todas las respuestas HTTP incluyen `X-Request-ID` para correlación operativa.
-- Prometheus incluye reglas SLO/alertas y `docs/runbooks/` describe el procedimiento ante incidentes.
+- Prometheus incluye reglas SLO/alertas, Alertmanager tiene un ejemplo y `docs/runbooks/` describe el procedimiento ante incidentes.
 - `k8s/base/` contiene la base Kustomize con HPA, PDB, probes y límites de recursos.
-- Los secretos de Kubernetes deben venir de External Secrets, Sealed Secrets o el proveedor cloud; no apliques `secrets.example.yaml` tal cual.
+- Los secretos de Kubernetes pueden venir de External Secrets Operator/Vault o archivos montados; adapta el ejemplo antes de aplicarlo.
 
 ## Stack tecnológico
 
@@ -140,7 +140,7 @@ Abre el dashboard en <http://localhost> y Grafana en <http://localhost:3002>. Pa
 | Vite dev server | `5173` (estricto) | `npm run dev`; `npm run preview` usa `4173` |
 
 > La imagen de MinIO por defecto es `cgr.dev/chainguard/minio` (MinIO ya no publica `minio/minio` en Docker Hub). Cámbiala con `MINIO_IMAGE`.
-> **Producción**: cambia las credenciales de PostgreSQL, MinIO y Grafana, y define `API_KEY`, `TENANT_API_KEYS` y `WS_TOKEN`.
+> **Producción**: cambia las credenciales de PostgreSQL, MinIO y Grafana, y define `API_KEY`, `TENANT_API_KEYS`, `WS_TICKET_SECRET` (≥ 32 caracteres) y `WS_AUTH_MODE=ticket`.
 
 ### Modo producción
 
@@ -149,13 +149,64 @@ El backend exige `ENVIRONMENT=production` junto con PostgreSQL y NATS reales, au
 ```bash
 ENVIRONMENT=production
 POSTGRES_HOST=postgres.internal
-NATS_URL=nats://nats.internal:4222
-API_KEY=<secreto-externo>
+POSTGRES_SSLMODE=verify-full
+POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+NATS_URL_FILE=/run/secrets/nats_url
+REDIS_URL_FILE=/run/secrets/redis_url
+API_KEY_FILE=/run/secrets/api_key
+WS_TICKET_SECRET_FILE=/run/secrets/ws_ticket_secret
+WS_AUTH_MODE=ticket
 CORS_ALLOWED_ORIGINS=https://analytics.example.com
 WS_ALLOWED_ORIGINS=https://analytics.example.com
+TRUSTED_PROXY_CIDRS=10.42.0.0/16
 ```
 
-La especificación HTTP versionada está en [`openapi.yaml`](./openapi.yaml). `/health` expresa liveness y `/ready` falla mientras PostgreSQL, NATS o el proceso de apagado impidan recibir tráfico.
+La especificación HTTP versionada está en [`openapi.yaml`](./openapi.yaml). `/health` expresa liveness y `/ready` falla mientras PostgreSQL, NATS, Redis (si está configurado) o el proceso de apagado impidan recibir tráfico.
+
+### Secretos, transporte y tracing
+
+El proveedor `internal/secrets` admite inyección por variables (por ejemplo, External
+Secrets Operator sincronizado con Vault) o archivos montados por Vault Agent, CSI o
+Compose. Para `API_KEY`, `WS_TICKET_SECRET`, `WS_TOKEN` (legado), `TENANT_API_KEYS`, `POSTGRES_PASSWORD`,
+`NATS_URL`, `REDIS_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` y
+`OTEL_EXPORTER_OTLP_HEADERS`, usa `NOMBRE_FILE` en lugar de `NOMBRE`; configurar ambos
+con valor es un error. Se leen solo al arrancar: tras rotar secretos reinicia las
+réplicas de forma gradual. El proceso no consulta Vault directamente.
+Los ejemplos alternativos de Vault Agent y ESO, incluidos sus roles y requisitos de
+rotación, están descritos en [`k8s/README.md`](./k8s/README.md).
+
+En producción son obligatorios `API_KEY`, `WS_TICKET_SECRET` (≥ 32 caracteres) con
+`WS_AUTH_MODE=ticket`, `POSTGRES_PASSWORD`,
+`POSTGRES_HOST`, `NATS_URL` con esquema `tls://` y credenciales (o `NATS_CREDS_FILE`),
+`REDIS_URL` con esquema `rediss://` y contraseña, `POSTGRES_SSLMODE=verify-full` y
+orígenes HTTPS explícitos. S3, si está activado, exige TLS y credenciales.
+Usa TLS directo configurando `TLS_CERT_FILE` y `TLS_KEY_FILE`, o termina TLS en un
+proxy confiable y configura `TRUSTED_PROXY_CIDRS` con sus redes reales. Solo se
+procesan `X-Forwarded-For` y `X-Forwarded-Proto` desde esos peers. Restringe a nivel
+de red el acceso directo al backend; los CIDR no sustituyen esa protección. No
+configures CIDR amplios con clientes no confiables.
+
+El cliente usa TLS 1.2 como mínimo y verifica certificados. Para CA privada usa
+`POSTGRES_SSLROOTCERT`, `NATS_TLS_CA_FILE`, `REDIS_TLS_CA_FILE`, `S3_TLS_CA_FILE` o
+`OTEL_EXPORTER_OTLP_CERTIFICATE` según corresponda. NATS, Redis y S3 admiten también
+`<SERVICIO>_TLS_CERT_FILE` y `<SERVICIO>_TLS_KEY_FILE` para mTLS. El certificado de
+PostgreSQL debe coincidir con `POSTGRES_HOST`. El Compose incluido es de desarrollo;
+para montar archivos, añade volúmenes o `secrets` en un override y deja vacío el valor
+directo correspondiente; monta el mismo secreto en Prometheus con `PROMETHEUS_API_KEY_FILE`
+si corresponde. Los probes Compose y Kubernetes de ejemplo usan HTTP y deben adaptarse
+si habilitas TLS directo. No es una configuración segura de producción. En `k8s/`
+hay ejemplos de ESO e ingress; sustituye nombres, redes y certificados antes del despliegue.
+
+Activa trazas con `OTEL_TRACING_ENABLED=true` y
+`OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com:4317`; el protocolo se
+elige mediante `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` o `http/protobuf` (puerto habitual
+4318 para HTTP). Se admiten las variables estándar del SDK OTLP para certificados,
+cabeceras y configuración del exporter. Para desarrollo sin TLS, configura el
+endpoint HTTP/inseguro explícitamente; producción exige HTTPS. Se propaga
+`traceparent` en HTTP y NATS; los lotes de consumo usan enlaces a los spans de los
+mensajes. Los logs contextuales incluyen `trace_id`, `span_id` y `request_id`; los
+probes no crean spans. Configura límites de muestreo, retención y control de acceso
+en el collector. No se garantiza entrega de trazas durante fallos del collector.
 
 Grafana arranca con Prometheus como fuente de datos y dos dashboards aprovisionados desde `grafana/` (carpeta *Analytics*): **Overview** (eventos, EPS, RPS, latencia p50/p95/p99, rechazos 429/503) y **NATS & Backend** (JetStream, DLQ, batch inserts).
 
@@ -183,10 +234,11 @@ En PowerShell define las variables con `$env:NOMBRE="valor"` y usa `npm.cmd` si 
 | Ruta | Método | Protección | Descripción |
 |---|---|---|---|
 | `/api/events` | POST | Rate limit por IP + clave de tenant o `API_KEY` | Ingesta de un evento (`202` / `400` / `401` / `403` / `429` / `503`) |
-| `/api/events/history?limit=N` | GET | `API_KEY` | Últimos eventos persistidos (def. 50, máx. 1000) |
-| `/api/metrics` | GET | `API_KEY` | Resumen agregado actual |
+| `/api/events/history?limit=N` | GET | Clave de tenant o `API_KEY` (+ `X-Tenant-ID`) | Últimos eventos persistidos del tenant (def. 50, máx. 1000) |
+| `/api/metrics` | GET | Clave de tenant o `API_KEY` (+ `X-Tenant-ID`) | Resumen agregado del tenant |
 | `/metrics` | GET | `API_KEY` | Métricas Prometheus |
-| `/ws` | WebSocket | `WS_TOKEN` o `API_KEY` (`?token=`, `Authorization: Bearer` o `X-API-Key`) | Resumen en tiempo real |
+| `/api/ws-ticket` | POST | Clave de tenant o `API_KEY` + rate limit | Emite un ticket efímero (`WS_TICKET_TTL`, def. 30 s) firmado con HMAC y ligado al tenant. Solo existe si `WS_TICKET_SECRET` está definido |
+| `/ws` | WebSocket | `?ticket=` (modo `ticket`); en modos `any`/`token`, también `WS_TOKEN`/`API_KEY` legados | Resumen en tiempo real: del **tenant** del ticket, o **global** con token estático |
 | `/api/dlq?limit=&after=&reason=` | GET | **Solo `API_KEY`** | Estadísticas y listado de la DLQ; `?seq=N` devuelve un mensaje completo |
 | `/api/dlq/redrive` | POST | **Solo `API_KEY`** | Reinyecta mensajes de la DLQ en el subject principal |
 | `/health` | GET | — | Sonda de vida |
@@ -202,7 +254,9 @@ Con las variables de autenticación vacías, las rutas correspondientes quedan a
 |---|---|---|
 | `API_KEY` | _(vacío)_ | Clave de **administración**: protege lecturas y `/metrics`, ingesta para cualquier tenant, vale como token de `/ws` y es la única válida para la DLQ. |
 | `TENANT_API_KEYS` | _(vacío)_ | Claves de ingesta por tenant: `clave1:tenantA,clave2:tenantB`. La clave fija el tenant. |
-| `WS_TOKEN` | _(vacío)_ | Token de solo lectura para `/ws` (apto para el navegador). |
+| `WS_AUTH_MODE` | `any` | `ticket` (obligatorio en producción): solo tickets efímeros; `any`: ticket o token estático; `token`: solo token estático (legado). |
+| `WS_TICKET_SECRET` / `WS_TICKET_TTL` | _(vacío)_ / `30s` | Secreto HMAC (≥ 32 caracteres) y vigencia de los tickets de `/api/ws-ticket`. |
+| `WS_TOKEN` | _(vacío)_ | **Legado / solo desarrollo**: token estático global para `/ws` (`?token=`). Rechazado con `WS_AUTH_MODE=ticket`. |
 | `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | `20` / `40` | Token bucket por IP en `/api/events`. |
 | `POSTGRES_HOST` | _(vacío)_ | Vacío = repositorio en memoria sin persistencia. |
 | `POSTGRES_PORT` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `5432` / `postgres` / _(vacío)_ / `analytics` | Conexión a PostgreSQL. |
@@ -213,12 +267,15 @@ Con las variables de autenticación vacías, las rutas correspondientes quedan a
 | `NATS_DURABLE` | `analytics-batch-writer` | Nombre del consumer durable. |
 | `NATS_DLQ_SUBJECT` | `analytics.dlq` | Subject de la Dead Letter Queue. |
 | `NATS_MAX_DELIVER` | `3` | Entregas máximas antes de enviar a la DLQ. |
+| `NATS_STREAM_REPLICAS` | `1` | Réplicas de los streams JetStream. Con `1` un `202` no sobrevive a la pérdida del nodo; en producción usa `3` sobre un clúster NATS de 3 nodos. |
+| `NATS_STREAM_MAX_AGE` | `72h` | Retención máxima de mensajes aún sin procesar; las interrupciones del consumer más largas pierden eventos. |
 | `BATCH_SIZE` / `BATCH_FLUSH_INTERVAL` | `500` / `1s` | Tamaño y ventana máxima de un lote. |
 | `DB_BREAKER_FAILURES` | `2` | Fallos consecutivos que abren el circuito (se limita a `NATS_MAX_DELIVER-1`). |
 | `DB_BREAKER_OPEN_TIMEOUT` | `15s` | Tiempo abierto antes de sondear la BD. |
 | `DB_BREAKER_SLOW_THRESHOLD` | `5s` | Un lote más lento cuenta como fallo. |
 | `DEDUP_TTL` / `DEDUP_MAX_ENTRIES` | `10m` / `100000` | Memoria de `event_id` ya vistos. |
 | `SHUTDOWN_TIMEOUT` | `25s` | Presupuesto del apagado ordenado (compose: `stop_grace_period: 30s`). |
+| `HTTP_ADDR` | `:8080` | Dirección de escucha HTTP o HTTPS. |
 | `LOG_LEVEL` | `info` | Nivel de log estructurado (`slog`): `debug`, `info`, `warn`, `error`. |
 | `LOG_FORMAT` | `text` | Formato de log: `text` o `json`. |
 | `S3_ENDPOINT` | _(vacío; compose: `minio:9000`)_ | `host:puerto`. Vacío = exportación a Parquet desactivada. |
@@ -232,7 +289,7 @@ Con las variables de autenticación vacías, las rutas correspondientes quedan a
 
 Las variables numéricas o de duración con un valor inválido (o no positivo) no abortan el arranque: se registra un aviso y se usa el valor por defecto.
 
-Fijos en código: puerto `:8080` y cola de 1000 eventos en modo directo. `EXPORT_POLL`, `EXPORT_UPLOAD_TIMEOUT` y `EXPORT_RETRY_*_DELAY` no están mapeados en `docker-compose.yml`; añádelos al bloque `environment` del backend si necesitas cambiarlos allí.
+Fijo en código: cola de 1000 eventos en modo directo. `HTTP_ADDR`, `EXPORT_POLL`, `EXPORT_UPLOAD_TIMEOUT` y `EXPORT_RETRY_*_DELAY` no están mapeados en `docker-compose.yml`; añádelos al bloque `environment` del backend si necesitas cambiarlos allí.
 
 ### Compose y frontend
 
@@ -242,11 +299,13 @@ Fijos en código: puerto `:8080` y cola de 1000 eventos en modo directo. `EXPORT
 | `GRAFANA_USER` / `GRAFANA_PASSWORD` | `admin` / `admin` | Acceso a Grafana. |
 | `FRONTEND_INGEST_KEY` / `FRONTEND_TENANT_ID` | _(vacío)_ | Clave de tenant y tenant que usa el dashboard para ingestar (build arg). |
 | `VITE_WS_URL` / `VITE_API_URL` | `ws://localhost:8080/ws` / `http://localhost:8080` | Endpoints del backend. |
-| `VITE_WS_TOKEN` / `VITE_API_KEY` | _(vacío)_ | Token del WebSocket (`?token=`) y clave de lectura. |
+| `VITE_API_URL` / `VITE_WS_URL` | `http://localhost:8080` / `ws://localhost:8080/ws` | URLs del backend en tiempo de build (Compose: `FRONTEND_API_URL` / `FRONTEND_WS_URL`). |
+| `VITE_WS_TICKET_URL` | _(vacío; Compose: `FRONTEND_WS_TICKET_URL`)_ | Endpoint que entrega el ticket de `/ws` (idealmente un BFF del mismo origen). Si está definido se ignora `VITE_WS_TOKEN`. |
+| `VITE_WS_TOKEN` / `VITE_API_KEY` | _(vacío)_ | Token estático del WebSocket (legado, solo desarrollo) y clave de lectura. |
 | `VITE_INGEST_API_KEY` / `VITE_TENANT_ID` | _(vacío)_ | Cabeceras de ingesta. |
 | `DEV_HOST` / `DEV_PORT` / `DEV_PREVIEW_PORT` | `localhost` / `5173` / `4173` | Host y puertos estrictos de Vite (`DEV_HOST=true` escucha en todas las interfaces). |
 
-> ⚠️ Todo `VITE_*` queda visible en el bundle. Usa `WS_TOKEN` (solo lectura) y una clave de tenant, nunca la de administración.
+> ⚠️ Todo `VITE_*` queda visible en el bundle. En producción usa `VITE_WS_TICKET_URL` (sin secretos de WebSocket en el bundle) y nunca la clave de administración; `VITE_WS_TOKEN` es solo para desarrollo local.
 
 ## Flujo de ingesta con NATS JetStream
 
@@ -304,7 +363,7 @@ El nombre incluye el rango de ids (`events-<desde>-<hasta>.parquet`) para que va
 - **Disparadores**: cada `EXPORT_POLL` se evalúa; se exporta al acumular `EXPORT_BATCH_SIZE` filas elegibles o al cumplirse `EXPORT_INTERVAL`. Si el lote sale lleno se siguen drenando lotes.
 - **Sin duplicados**: antes de subir se persiste el rango (`pending_to`). Un reintento o reinicio reutiliza exactamente ese rango y las mismas claves, así que los objetos se sobrescriben. La marca de agua avanza solo tras subir **todas** las particiones.
 - **Un único exportador**: un advisory lock de PostgreSQL garantiza que solo una réplica exporta.
-- **Desfase (`EXPORT_LAG`)**: solo se exportan filas más antiguas que el desfase, porque los ids de una secuencia no se confirman estrictamente en orden. ⚠️ Una transacción abierta durante más tiempo que el desfase podría quedar fuera.
+- **Orden de confirmación**: los ids de una secuencia no se confirman en orden estricto. Un lote solo incluye filas insertadas por transacciones más antiguas que cualquier escritor en curso (`age(xmin)` frente a `pg_stat_activity.backend_xid`) y se corta en la primera fila aún no estable, así que una transacción lenta retrasa la exportación en lugar de quedar fuera. Requiere que el usuario de la aplicación vea las transacciones de su propio rol (el caso normal). `EXPORT_LAG` queda como margen adicional.
 - **Reintentos**: backoff exponencial con jitter. Los errores permanentes (credenciales, bucket inexistente, 4xx salvo 408/429) no se reintentan. Tras agotar reintentos, el exportador espera con backoff creciente (máx. 5 min) y retoma el mismo rango.
 - **No se borran filas** de `events` tras exportar.
 - **Métricas**: `analytics_parquet_exported_total` (archivos), `_exported_events_total`, `_bytes_transferred_total`, `_export_duration_seconds{result}`, `_export_errors_total{stage}`, `_upload_retries_total`, `_last_success_timestamp_seconds`, `_watermark_id`.
@@ -380,11 +439,52 @@ curl "http://localhost:8080/api/events/history?limit=10"
 curl http://localhost:8080/metrics
 ```
 
-WebSocket (el navegador no puede fijar cabeceras, por eso se usa `?token=`): `ws://localhost:8080/ws?token=<WS_TOKEN>`.
+WebSocket (el navegador no puede fijar cabeceras, por eso la credencial va en la URL). Con `WS_TICKET_SECRET` definido, pide un ticket y conéctate antes de que caduque:
+
+```bash
+curl -X POST -H "X-API-Key: <clave-de-tenant>" http://localhost:8080/api/ws-ticket
+# {"ticket":"…","tenant":"tenantA","expires_in":30}
+# ws://localhost:8080/ws?ticket=<ticket>
+```
+
+En desarrollo (`WS_AUTH_MODE=any`) sigue aceptándose el token estático legado: `ws://localhost:8080/ws?token=<WS_TOKEN>`.
 
 > En PowerShell usa `curl.exe` y envía el cuerpo desde un archivo (`--data-binary "@evento.json"`) para evitar problemas de comillas.
 
 ### Simulación de tráfico masivo
+
+#### Suite reproducible k6
+
+La suite [`scripts/load/ingest.js`](scripts/load/ingest.js) ofrece perfiles
+`smoke` (5 req/s, 30 s), `load` (100 req/s, 2 min) y `stress` (500 req/s, 3 min)
+con tasa de llegada constante. Comprueba `/ready`, acepta solo `202`, mide p95 y
+errores, y falla si k6 no puede generar la tasa (`dropped_iterations`). Genera un
+identificador único por ejecución, VU e iteración. Es una prueba de la API; un `202`
+no demuestra que todos los eventos se hayan persistido. Para medir durabilidad,
+correlaciona los identificadores con PostgreSQL y espera a que se vacíe el backlog.
+
+Con Docker Compose local, asigna límites superiores a la tasa del perfil antes de
+arrancar el backend y monitoriza los recursos de la máquina generadora:
+
+```powershell
+$env:RATE_LIMIT_RPS="1000"; $env:RATE_LIMIT_BURST="1200"
+docker compose up -d --build
+$env:PROFILE="smoke"; k6 run scripts/load/ingest.js
+$env:PROFILE="load";  k6 run scripts/load/ingest.js
+$env:PROFILE="stress"; k6 run scripts/load/ingest.js
+```
+
+Opciones: `BASE_URL`, `API_KEY`, `TENANT_ID`, `PROFILE`, `RATE`, `DURATION`,
+`VUS`, `MAX_VUS`, `P95_MS` y `MAX_ERROR_RATE`. Por ejemplo:
+
+```bash
+PROFILE=smoke RATE=5 DURATION=30s BASE_URL=http://localhost:8080 k6 run scripts/load/ingest.js
+```
+
+No uses credenciales de administración en un equipo o entorno no confiable. La tasa,
+el hardware, la topología, las versiones de las imágenes y los datos previos afectan
+los resultados; registra esos datos al comparar ejecuciones. Los umbrales son
+objetivos de prueba, no una garantía de capacidad ni un SLO de producción.
 
 **Desde el dashboard**: el panel *Simulador de Tráfico* ofrece "Simular Ráfaga (50 Eventos)" (50 eventos `user_action` con payloads aleatorios; reintenta los `429`) y cargas de 50/200/1000 eventos con progreso y cancelación. Muestra spinner y toasts, y bloquea los botones mientras hay una simulación activa.
 
@@ -537,12 +637,56 @@ npm run build      # type-check (tsc estricto) + build de producción
 ## Decisiones de diseño y limitaciones conocidas
 
 - **Garantías de entrega**: con NATS es *at-least-once* con deduplicación (efecto *exactly-once* en el almacenamiento). En modo directo (sin `NATS_URL`) la cola es en memoria y un reinicio pierde los eventos aún no procesados.
-- **Resumen no persistente**: `MetricSummary` empieza en cero al reiniciar; el historial completo permanece en PostgreSQL. Además, con ingesta por lotes solo se ve el último evento de cada lote.
-- **IP del cliente**: el rate limiter usa `RemoteAddr`. Detrás de un proxy inverso hay que resolver la IP real de forma confiable (`X-Forwarded-For` es falsificable).
-- **CORS abierto (`*`)**: apropiado para desarrollo; en producción restringe los orígenes.
-- **Token de `/ws` estático**: es un secreto compartido sin expiración y, en la URL, puede quedar en logs de proxies. Para producción: tokens de corta duración (JWT) y `wss://`.
-- **Lecturas no segmentadas por tenant**: el resumen y el historial son una vista global de operador; las claves de tenant solo sirven para **ingestar**.
+- **Resumen**: con Redis configurado, los contadores son persistentes y compartidos entre réplicas; sin Redis, `MetricSummary` vive en memoria y empieza en cero al reiniciar. El historial completo permanece en PostgreSQL. Con ingesta por lotes solo se ve el último evento de cada lote.
+- **IP del cliente**: el rate limiter usa la IP del peer; `X-Forwarded-For`/`X-Forwarded-Proto` solo se aceptan desde `TRUSTED_PROXY_CIDRS`. Producción exige TLS directo o esos CIDR.
+- **CORS**: Compose usa `*` para desarrollo; `ENVIRONMENT=production` exige orígenes HTTPS explícitos en `CORS_ALLOWED_ORIGINS` y `WS_ALLOWED_ORIGINS`.
+- **Autenticación de `/ws`**: producción exige `WS_AUTH_MODE=ticket` (tickets HMAC de corta duración ligados a un tenant, emitidos por `/api/ws-ticket`). El ticket viaja en la URL pero caduca en segundos; usa `wss://`. `WS_TOKEN` queda como modo legado de desarrollo.
+- **Lecturas por tenant**: `/api/metrics`, `/api/events/history` y `/ws` con ticket devuelven solo datos del tenant de la credencial (`API_KEY` elige el tenant con `X-Tenant-ID`, por defecto `default`); el agregado global solo se emite por `/ws` con `API_KEY` o el token estático legado.
 - **Sin claves configuradas, `X-Tenant-ID` no es verificable**. Define `TENANT_API_KEYS` o `API_KEY` para que sea de confianza.
 - **Cardinalidad de métricas**: la etiqueta `event_type` se limita a 50 valores; el resto se agrupa como `other`.
 - **Crecimiento de la tabla**: `events` crece sin límite y no se purga tras exportar a Parquet; define una política de retención o particiona por `created_at`.
 - **Sustituir el repositorio**: basta con implementar `domain.BatchEventRepository` e inyectarlo en `newEventRepository()` de `cmd/api/main.go`.
+
+
+## Aislamiento y consistencia de métricas
+
+- **Tenants**: los resúmenes de Redis se guardan por tenant (`<prefix>:summary:t:<tenant>`) y un agregado global separado (`:summary:g`). `/api/metrics` con la clave de un tenant, incluido `default`, solo devuelve sus datos; en `/ws`, un ticket de `/api/ws-ticket` liga la conexión a su tenant, y el agregado global solo se entrega con `API_KEY` o el token estático legado (`WS_TOKEN`, modos `any`/`token`).
+- **Contadores idempotentes**: Redis cuenta cada evento una sola vez por `tenant:event_id` (script Lua atómico, TTL 7 días). El consumer actualiza Redis **antes** del ack: si Redis falla, el lote vuelve a la cola y se reintenta sin duplicar conteos aunque PostgreSQL descarte duplicados.
+- **DLQ**: el contador de mensajes muertos es global; un mensaje que no se puede decodificar no pertenece a ningún tenant.
+- **Alta disponibilidad de JetStream**: con `NATS_STREAM_REPLICAS=3` sobre un clúster NATS de 3 nodos un `202` sobrevive a la pérdida de un nodo. Con el valor por defecto (`1`) no. `NATS_STREAM_MAX_AGE` limita cuánto puede estar parado el consumer sin perder mensajes.
+- **Redis** debe ejecutarse como primario único (con Sentinel/réplica gestionada), no como Redis Cluster: el script usa claves que no comparten *hash slot*.
+- **CI**: el job `integration` ejecuta las pruebas con PostgreSQL, Redis y NATS JetStream reales.
+
+## Listo para portafolio vs. Requisitos de infraestructura real en producción
+
+### Listo para portafolio (verificado en este repositorio)
+
+| Área | Qué hay | Cómo se verifica |
+|---|---|---|
+| Servicio | API Go, ingesta directa o por NATS JetStream con DLQ y re-drive, PostgreSQL, Redis, exportación Parquet/S3, dashboard React | `go test ./...`, `npm test`, job `integration` con PostgreSQL/Redis/NATS reales |
+| Seguridad de la app | Claves por tenant, tickets WebSocket efímeros (`WS_AUTH_MODE=ticket`), validación estricta con `ENVIRONMENT=production`, secretos por variables o `*_FILE` | Pruebas de `cmd/api` e `internal/middleware` |
+| Calidad de código | `gofmt`, `go vet`, `golangci-lint` v2 ([`.golangci.yml`](./.golangci.yml)), `go test -race`, Vitest | Jobs `backend`, `lint` y `frontend` de [`ci.yml`](./.github/workflows/ci.yml) |
+| Cadena de suministro | `govulncheck`, `npm audit --audit-level=high`, Trivy (filesystem, secretos e imágenes, HIGH/CRITICAL corregibles), SBOM CycloneDX de ambas imágenes, Actions fijadas por SHA, Dependabot | Jobs `security` y `docker` de [`ci.yml`](./.github/workflows/ci.yml); [`dependabot.yml`](./.github/dependabot.yml); [SECURITY.md](./SECURITY.md) |
+| Publicación de imagen | Backend en GHCR con SBOM, provenance SLSA (BuildKit) y firma keyless `cosign` por digest al crear un tag `v*.*.*` | [`release.yml`](./.github/workflows/release.yml) |
+| Observabilidad | Métricas Prometheus, SLO con burn-rate multiventana, alertas de latencia y pérdida de eventos, Alertmanager de ejemplo, trazas OTLP | Job `observability` (`promtool check/test rules`, `amtool check-config`); ver [docs/slo.md](./docs/slo.md) |
+| Resiliencia | Circuit breaker, reintentos, deduplicación, script de caídas de NATS/PostgreSQL/Redis con k6 | [`scripts/resilience/outage.ps1`](./scripts/resilience/outage.ps1); resultados en [docs/resilience.md](./docs/resilience.md) |
+| Backup/restore | `pg_dump`/`pg_restore`, AOF de Redis, `nats backup stream` / `nats backup restore stream` | Probado en Compose; ver [docs/runbooks/backup-restore.md](./docs/runbooks/backup-restore.md) |
+| Despliegue | Compose (perfil `alerting` opcional), Kustomize base + overlays, Vault Agent y ESO como plantillas; contenedores sin root (UID fijo), `readOnlyRootFilesystem`, `capabilities: drop ALL`, seccomp `RuntimeDefault` y Pod Security `restricted` | `docker compose config`; job `k8s` (`kubectl kustomize` + `kubeconform -strict`) |
+
+La firma `cosign` se aplica a la imagen publicada (por digest) en `release.yml`, no a artefactos de CI. El digest resultante aparece en el resumen del job y es el que debe fijarse en `k8s/overlays/production-example`.
+
+### Requisitos de infraestructura real en producción
+
+- **Kubernetes y secretos**: clúster real con namespaces, RBAC, NetworkPolicy, ingress, certificados y Vault/ESO aplicados; imagen publicada en un registro y referenciada por digest inmutable.
+- **Datos con alta disponibilidad**: PostgreSQL gestionado o replicado con PITR, clúster NATS de 3 nodos (`NATS_STREAM_REPLICAS=3`), Redis con Sentinel/réplica gestionada y object storage S3 real; backups programados con restauraciones de prueba periódicas.
+- **Alertas reales**: Alertmanager desplegado con receptores reales (PagerDuty/Opsgenie/Slack/webhook) y una prueba de notificación, acknowledgement y escalado.
+- **Validación con carga real**: k6 y simulacros de caída contra infraestructura representativa; los resultados de este repositorio provienen de un entorno Compose de un solo nodo.
+- **Gobierno de la cadena de suministro**: política de admisión que verifique firmas (Kyverno/Sigstore policy-controller), retención de SBOM y proceso de excepciones de CVE.
+- **Dashboard en Kubernetes**: los manifiestos solo despliegan el backend. El frontend incrusta sus URLs en el build (`VITE_*`), así que requiere una imagen por entorno o configuración en runtime, además de su propio Deployment/Ingress.
+- **Clave de ingesta en el navegador**: el panel de ingesta/simulador del dashboard usa `VITE_INGEST_API_KEY`, visible en el bundle. Es aceptable para la demo; en producción la ingesta desde navegador debe pasar por un BFF/sesión.
+
+Consulta también [k8s/README.md](./k8s/README.md) y [alertmanager.example.yml](./alertmanager.example.yml).
+
+## Licencia
+
+[MIT](./LICENSE) © 2026 Facundo Ariel Barrios Ifran.

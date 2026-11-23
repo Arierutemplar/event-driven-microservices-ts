@@ -7,3 +7,5 @@ resources:
   - backend-service.yaml
   - pdb.yaml
   - hpa.yaml
+  - networkpolicy.yaml
+  - networkpolicy-egress.yaml

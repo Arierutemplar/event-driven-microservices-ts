@@ -1,4 +1,5 @@
-import { WS_URL } from "../config";
+import { WS_TICKET_URL, WS_URL } from "../config";
+import { fetchTicketUrl } from "../lib/wsUrl";
 import { useAnalyticsStream } from "../hooks/useAnalyticsStream";
 import { useFlash } from "../hooks/useFlash";
 import { useIngest } from "../hooks/useIngest";
@@ -17,7 +18,9 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ url = WS_URL }: DashboardProps) {
-  const { metrics, live, status, retries, reconnect, feed, throughput, eps, total } = useAnalyticsStream(url);
+  const ticketURL = WS_TICKET_URL;
+  const resolveUrl = ticketURL ? () => fetchTicketUrl(url, ticketURL) : undefined;
+  const { metrics, live, status, retries, reconnect, feed, throughput, eps, total } = useAnalyticsStream(url, resolveUrl);
   const ingest = useIngest();
   const sim = useTrafficSimulator({ onResult: ingest.record });
   const flash = useFlash(live);

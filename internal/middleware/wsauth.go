@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 // WSToken exige un token válido antes de aceptar el upgrade a WebSocket. El token se lee de,

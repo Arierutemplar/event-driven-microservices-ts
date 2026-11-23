@@ -12,10 +12,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./c
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/dlqctl ./cmd/dlqctl
 
 FROM alpine:3.22
-RUN addgroup -S app && adduser -S -G app app
+RUN apk add --no-cache ca-certificates
+RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app app
 COPY --from=build /out/api /usr/local/bin/api
 COPY --from=build /out/dlqctl /usr/local/bin/dlqctl
 
-USER app
+# UID numérico: coincide con runAsUser de k8s y permite verificar runAsNonRoot.
+USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["api"]

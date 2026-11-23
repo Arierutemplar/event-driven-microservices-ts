@@ -11,11 +11,18 @@ function withToken(raw: string, token: string | undefined): string {
 /**
  * Endpoints del backend; sobreescribibles con VITE_WS_URL / VITE_API_URL / VITE_API_KEY.
  * Atención: todo VITE_* queda incrustado en el bundle y es visible para cualquiera que abra la
- * página. Úsalos con WS_TOKEN (solo lectura) y una clave de tenant de demostración, nunca con la
- * clave de administración en producción.
+ * página. VITE_WS_TOKEN es un modo legado de desarrollo; en producción usa VITE_WS_TICKET_URL y
+ * nunca la clave de administración.
  */
 export const WS_TOKEN: string | undefined = env.VITE_WS_TOKEN || undefined;
-export const WS_URL: string = withToken(env.VITE_WS_URL ?? "ws://localhost:8080/ws", WS_TOKEN);
+/**
+ * Endpoint (preferiblemente del mismo origen y autenticado por tu sesión/BFF) que devuelve un ticket
+ * efímero ligado a un tenant (POST /api/ws-ticket). Si está definido, se ignora VITE_WS_TOKEN y el
+ * bundle no contiene ningún secreto de WebSocket.
+ */
+export const WS_TICKET_URL: string | undefined = env.VITE_WS_TICKET_URL || undefined;
+const BASE_WS_URL: string = env.VITE_WS_URL ?? "ws://localhost:8080/ws";
+export const WS_URL: string = WS_TICKET_URL ? BASE_WS_URL : withToken(BASE_WS_URL, WS_TOKEN);
 export const API_URL: string = (env.VITE_API_URL ?? "http://localhost:8080").replace(/\/$/, "");
 export const API_KEY: string | undefined = env.VITE_API_KEY || undefined;
 

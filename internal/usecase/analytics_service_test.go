@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/dedup"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 // fakeRepo es un EventRepository thread-safe para las pruebas.

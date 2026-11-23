@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
 )
 
 const (
@@ -75,12 +75,24 @@ func (s *PostgresExportSource) State(ctx context.Context) (domain.ExportState, e
 	return st, nil
 }
 
+// Plan elige un lote contiguo de ids cuyo contenido ya no puede cambiar. Un id menor puede confirmarse
+// después de uno mayor, así que solo se exportan filas insertadas por transacciones más antiguas que
+// cualquier escritor en curso (age(xmin) mayor que la edad del xid activo más antiguo) y el lote se
+// corta en la primera fila que no cumple. created_at < before se mantiene como margen adicional.
 func (s *PostgresExportSource) Plan(ctx context.Context, afterID int64, before time.Time, limit int) (int64, int, error) {
 	var upTo int64
 	var n int
 	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(max(id), 0), count(*)
-		FROM (SELECT id FROM events WHERE id > $1 AND created_at < $2 ORDER BY id LIMIT $3) t`,
+		WITH oldest AS (
+			SELECT COALESCE(max(age(backend_xid)), -1) AS a
+			FROM pg_stat_activity
+			WHERE backend_xid IS NOT NULL AND pid <> pg_backend_pid()
+		), cand AS (
+			SELECT id, age(xmin) > (SELECT a FROM oldest) AS settled
+			FROM events WHERE id > $1 AND created_at < $2 ORDER BY id LIMIT $3
+		)
+		SELECT COALESCE(max(id), 0), count(*) FROM cand
+		WHERE id < COALESCE((SELECT min(id) FROM cand WHERE NOT settled), 9223372036854775807)`,
 		afterID, before, limit).Scan(&upTo, &n)
 	if err != nil {
 		return 0, 0, fmt.Errorf("export: planificar lote: %w", err)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,16 +17,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/distributed"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/handler"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/middleware"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/queue"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/repository"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/resilience"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/usecase"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/dedup"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/distributed"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/handler"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/middleware"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/queue"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/repository"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/resilience"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/usecase"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -97,12 +98,13 @@ func newEventRepository() (domain.BatchEventRepository, io.Closer, func(context.
 	}
 
 	cfg := repository.PostgresConfig{
-		Host:     host,
-		Port:     envString("POSTGRES_PORT", "5432"),
-		User:     envString("POSTGRES_USER", "postgres"),
-		Password: os.Getenv("POSTGRES_PASSWORD"),
-		DBName:   envString("POSTGRES_DB", "analytics"),
-		SSLMode:  envString("POSTGRES_SSLMODE", "disable"),
+		Host:        host,
+		Port:        envString("POSTGRES_PORT", "5432"),
+		User:        envString("POSTGRES_USER", "postgres"),
+		Password:    os.Getenv("POSTGRES_PASSWORD"),
+		DBName:      envString("POSTGRES_DB", "analytics"),
+		SSLMode:     envString("POSTGRES_SSLMODE", "disable"),
+		SSLRootCert: os.Getenv("POSTGRES_SSLROOTCERT"),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -155,32 +157,22 @@ func main() {
 // lugar de abortar para que los defer de limpieza se ejecuten.
 func run() error {
 	slog.Info("iniciando microservicio de analíticas")
-	if strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") {
-		if os.Getenv("API_KEY") == "" && os.Getenv("TENANT_API_KEYS") == "" {
-			return errors.New("producción requiere API_KEY o TENANT_API_KEYS")
-		}
-		if os.Getenv("POSTGRES_HOST") == "" {
-			return errors.New("producción requiere POSTGRES_HOST")
-		}
-		if os.Getenv("NATS_URL") == "" {
-			return errors.New("producción requiere NATS_URL")
-		}
-		if os.Getenv("REDIS_URL") == "" {
-			return errors.New("producción requiere REDIS_URL")
-		}
-		if os.Getenv("CORS_ALLOWED_ORIGINS") == "" {
-			return errors.New("producción requiere CORS_ALLOWED_ORIGINS")
-		}
-		if os.Getenv("CORS_ALLOWED_ORIGINS") == "*" {
-			return errors.New("producción no permite CORS_ALLOWED_ORIGINS=*")
-		}
-		if os.Getenv("WS_ALLOWED_ORIGINS") == "" {
-			return errors.New("producción requiere WS_ALLOWED_ORIGINS")
-		}
-		if os.Getenv("WS_ALLOWED_ORIGINS") == "*" {
-			return errors.New("producción no permite WS_ALLOWED_ORIGINS=*")
-		}
+	if err := loadConfiguration(); err != nil {
+		return fmt.Errorf("configuración: %w", err)
 	}
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownTracing, err := observability.InitTracing(traceCtx)
+	traceCancel()
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			slog.Error("apagar tracing", "error", err)
+		}
+	}()
 
 	eventRepo, closer, dbGate, dbPing, err := newEventRepository()
 	if err != nil {
@@ -205,6 +197,14 @@ func run() error {
 			return
 		}
 		wsHandler.Broadcast(data)
+		for _, tenant := range wsHandler.Tenants() {
+			tenantData, err := json.Marshal(analyticsService.GetSummaryForTenant(tenant))
+			if err != nil {
+				slog.Error("serializar resumen de tenant", "error", err)
+				continue
+			}
+			wsHandler.BroadcastTenant(tenant, tenantData)
+		}
 	}
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -239,21 +239,27 @@ func run() error {
 		// inserta por lotes en la base de datos y actualiza el resumen.
 		connCtx, cancel := context.WithTimeout(rootCtx, 45*time.Second)
 		qc, err = queue.Connect(connCtx, queue.Config{
-			URL:           natsURL,
-			Stream:        envString("NATS_STREAM", "EVENTS"),
-			Subject:       envString("NATS_SUBJECT", "events.ingest"),
-			Durable:       envString("NATS_DURABLE", "analytics-batch-writer"),
-			DLQSubject:    envString("NATS_DLQ_SUBJECT", "analytics.dlq"),
-			MaxDeliver:    envInt("NATS_MAX_DELIVER", 3),
-			BatchSize:     envInt("BATCH_SIZE", 500),
-			FlushInterval: envDuration("BATCH_FLUSH_INTERVAL", time.Second),
+			URL:             natsURL,
+			Stream:          envString("NATS_STREAM", "EVENTS"),
+			Subject:         envString("NATS_SUBJECT", "events.ingest"),
+			Durable:         envString("NATS_DURABLE", "analytics-batch-writer"),
+			DLQSubject:      envString("NATS_DLQ_SUBJECT", "analytics.dlq"),
+			MaxDeliver:      envInt("NATS_MAX_DELIVER", 3),
+			Replicas:        envInt("NATS_STREAM_REPLICAS", 1),
+			MaxAge:          envDuration("NATS_STREAM_MAX_AGE", 72*time.Hour),
+			BatchSize:       envInt("BATCH_SIZE", 500),
+			FlushInterval:   envDuration("BATCH_FLUSH_INTERVAL", time.Second),
+			TLSCAFile:       os.Getenv("NATS_TLS_CA_FILE"),
+			TLSCertFile:     os.Getenv("NATS_TLS_CERT_FILE"),
+			TLSKeyFile:      os.Getenv("NATS_TLS_KEY_FILE"),
+			CredentialsFile: os.Getenv("NATS_CREDS_FILE"),
 		})
 		cancel()
 		if err != nil {
 			return fmt.Errorf("conectar a NATS: %w", err)
 		}
 		natsReady.Store(true)
-		slog.Info("NATS JetStream conectado", "url", natsURL)
+		slog.Info("NATS JetStream conectado")
 
 		analyticsService.WithPublisher(qc)
 		qc.Gate = dbGate
@@ -263,10 +269,15 @@ func run() error {
 			broadcastSummary()
 		}
 		consumerDone = make(chan struct{})
+		onBatch := analyticsService.RecordProcessed
+		if redisStore != nil {
+			qc.Aggregate = analyticsService.AggregateDistributed
+			onBatch = analyticsService.ApplyLocal
+		}
 		go func() {
 			defer close(consumerDone)
 			qc.RunConsumer(consumerCtx, eventRepo, func(batch []*domain.Event) {
-				analyticsService.RecordProcessed(batch)
+				onBatch(batch)
 				broadcastSummary()
 			})
 		}()
@@ -289,7 +300,10 @@ func run() error {
 	// Exportador a Parquet / data lake (opcional: solo con S3_ENDPOINT y PostgreSQL)
 	exportCtx, stopExport := context.WithCancel(context.Background())
 	defer stopExport()
-	exportDone := startExporter(exportCtx, closer)
+	exportDone, err := startExporter(exportCtx, closer)
+	if err != nil {
+		return err
+	}
 
 	// Seguridad: API_KEY vacío desactiva la verificación (modo opcional)
 	if os.Getenv("API_KEY") == "" {
@@ -308,10 +322,24 @@ func run() error {
 	if !tenantAuth.Enabled() {
 		slog.Warn("sin API keys: ingesta sin autenticación; X-Tenant-ID es informativo (no verificable)")
 	}
-	// WebSocket: acepta WS_TOKEN (solo lectura, apto para el navegador) o la clave de administración
-	wsAuth := middleware.WSToken(os.Getenv("WS_TOKEN"), os.Getenv("API_KEY"))
-	if os.Getenv("WS_TOKEN") == "" && os.Getenv("API_KEY") == "" {
-		slog.Warn("WS_TOKEN/API_KEY no definidos: /ws sin autenticación")
+	// WebSocket: tickets efímeros ligados a un tenant (POST /api/ws-ticket con la API key) y, por
+	// compatibilidad, WS_TOKEN/API_KEY como vista global. WS_AUTH_MODE: any (defecto) | ticket | token.
+	wsMode := strings.ToLower(envString("WS_AUTH_MODE", middleware.WSModeAny))
+	if wsMode != middleware.WSModeAny && wsMode != middleware.WSModeTicket && wsMode != middleware.WSModeToken {
+		return fmt.Errorf("WS_AUTH_MODE inválido %q (any|ticket|token)", wsMode)
+	}
+	var wsTicketer *middleware.WSTicketer
+	if secret := os.Getenv("WS_TICKET_SECRET"); secret != "" {
+		wsTicketer, err = middleware.NewWSTicketer(secret, envDuration("WS_TICKET_TTL", 30*time.Second))
+		if err != nil {
+			return err
+		}
+	} else if wsMode == middleware.WSModeTicket {
+		return fmt.Errorf("WS_AUTH_MODE=ticket requiere WS_TICKET_SECRET")
+	}
+	wsAuth := middleware.WSAuth(wsMode, wsTicketer, os.Getenv("WS_TOKEN"), os.Getenv("API_KEY"))
+	if wsTicketer == nil && os.Getenv("WS_TOKEN") == "" && os.Getenv("API_KEY") == "" {
+		slog.Warn("WS_TICKET_SECRET/WS_TOKEN/API_KEY no definidos: /ws sin autenticación")
 	}
 	stopLimiter := make(chan struct{})
 	defer close(stopLimiter)
@@ -340,7 +368,7 @@ func run() error {
 		}
 	})
 	// Readiness: pasa a 503 en cuanto empieza el apagado para que el balanceador deje de enviar tráfico
-	http.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		if shuttingDown.Load() {
 			http.Error(w, "apagando", http.StatusServiceUnavailable)
 			return
@@ -351,6 +379,15 @@ func run() error {
 			if err := dbPing(pingCtx); err != nil {
 				http.Error(w, "base de datos no disponible", http.StatusServiceUnavailable)
 				return
+			}
+			if redisStore != nil {
+				pingCtx, pingCancel := context.WithTimeout(r.Context(), 750*time.Millisecond)
+				err := redisStore.Ping(pingCtx)
+				pingCancel()
+				if err != nil {
+					http.Error(w, "Redis no disponible", http.StatusServiceUnavailable)
+					return
+				}
 			}
 		}
 		if os.Getenv("NATS_URL") != "" && !natsReady.Load() {
@@ -384,26 +421,55 @@ func run() error {
 	http.HandleFunc("/api/dlq", observability.Instrument("/api/dlq", adminLimiter.Limit(admin(http.HandlerFunc(dlqH.List)).ServeHTTP)))
 	http.HandleFunc("/api/dlq/redrive", observability.Instrument("/api/dlq/redrive", adminLimiter.Limit(admin(http.HandlerFunc(dlqH.Redrive)).ServeHTTP)))
 	http.HandleFunc("/ws", wsAuth(wsHandler.HandleConnections))
+	if wsTicketer != nil {
+		http.HandleFunc("/api/ws-ticket", observability.Instrument("/api/ws-ticket", limiter.Limit(tenantAuth.Read(wsTicketer.IssueHandler()))))
+	}
 
-	const addr = ":8080"
+	addr := envString("HTTP_ADDR", ":8080")
 	slog.Info("servidor escuchando", "addr", addr)
 
 	// CORS envuelve todo el mux (DefaultServeMux) de forma global. Los timeouts de cabeceras y
 	// de inactividad protegen frente a clientes lentos sin cortar las conexiones WebSocket.
-	srv := &http.Server{
-		Addr: addr,
-		Handler: middleware.RequestContext(
+	httpHandler, err := middleware.TrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"),
+		observability.TraceHTTP(middleware.RequestContext(
 			middleware.CORSAllowed(os.Getenv("CORS_ALLOWED_ORIGINS"), http.DefaultServeMux),
-		),
+		)))
+	if err != nil {
+		return fmt.Errorf("proxies confiables: %w", err)
+	}
+	certFile, keyFile := os.Getenv("TLS_CERT_FILE"), os.Getenv("TLS_KEY_FILE")
+	if (certFile == "") != (keyFile == "") {
+		return errors.New("TLS_CERT_FILE y TLS_KEY_FILE deben configurarse juntos")
+	}
+	var serverTLS *tls.Config
+	if certFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return fmt.Errorf("cargar certificado TLS del servidor: %w", err)
+		}
+		serverTLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           httpHandler,
+		TLSConfig:         serverTLS,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+	serverErr := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if serverTLS != nil {
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("servidor HTTP", "error", err)
+			serverErr <- err
 			stop()
 		}
 	}()
@@ -467,5 +533,10 @@ func run() error {
 		slog.Error("apagado: cierre del repositorio", "error", err)
 	}
 	slog.Info("apagado completo")
+	select {
+	case err := <-serverErr:
+		return fmt.Errorf("servidor HTTP: %w", err)
+	default:
+	}
 	return nil
 }

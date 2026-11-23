@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Requires External Secrets Operator CRDs. The namespace of every resource is set by the
+# overlay that includes this directory, so namespaces stay consistent.
+resources:
+  - serviceaccount.yaml
+  - secretstore.example.yaml
+  - externalsecret.example.yaml

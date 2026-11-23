@@ -7,12 +7,17 @@ name: CI
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
       - run: go mod download
@@ -20,25 +25,168 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Start NATS with JetStream
+        run: docker run -d --name nats -p 4222:4222 nats:2-alpine -js
+      - name: Integration tests against real services
+        env:
+          TEST_POSTGRES_DSN: postgres://postgres:pw@localhost:5432/postgres?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/0
+          TEST_NATS_URL: nats://localhost:4222
+        run: go test -race -count=1 -v ./internal/... 2>&1 | tee /tmp/it.txt; ! grep -q -- "--- FAIL" /tmp/it.txt
+
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      - run: npm test
       - run: npm run build
+
+  # Análisis de dependencias: falla ante vulnerabilidades alcanzables (Go) o altas (npm).
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck (Go)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: npm audit (frontend)
+        working-directory: frontend
+        run: npm audit --audit-level=high
+      - name: Trivy filesystem (dependencias y secretos)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          skip-dirs: frontend/node_modules
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  # Reglas de alertas y configuración de Prometheus/Alertmanager.
+  observability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: promtool check + test rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD:/w:ro" -w /w prom/prometheus:latest check rules prometheus-rules.yml
+          docker run --rm --entrypoint promtool -v "$PWD:/w:ro" -w /w prom/prometheus:latest test rules prometheus-rules.test.yml
+      - name: amtool check-config
+        run: docker run --rm --entrypoint amtool -v "$PWD:/w:ro" -w /w prom/alertmanager:latest check-config alertmanager.example.yml
+
+  # Render de todos los targets de Kustomize y validación estricta de esquemas (CRDs omitidos).
+  k8s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: kustomize + kubeconform
+        run: |
+          mkdir -p /tmp/k8s
+          for t in base overlays/local overlays/production-example vault-agent eso; do
+            kubectl kustomize "k8s/$t" > "/tmp/k8s/${t//\//_}.yaml"
+          done
+          docker run --rm -v /tmp/k8s:/m:ro ghcr.io/yannh/kubeconform:v0.7.0 \
+            -strict -summary -ignore-missing-schemas -kubernetes-version 1.33.0 /m
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker compose config --quiet
-      - run: docker build -t analytics-service:test .
-      - run: docker build -t analytics-dashboard:test ./frontend
+      - run: docker build -t event-driven-microservices-ts:ci .
+      - run: docker build -t analytics-dashboard:ci ./frontend
+      - name: Trivy image (backend)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: event-driven-microservices-ts:ci
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Trivy image (frontend)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: analytics-dashboard:ci
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-setup-trivy: true
+      - name: SBOM CycloneDX (backend)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: event-driven-microservices-ts:ci
+          format: cyclonedx
+          output: sbom-event-driven-microservices-ts.cdx.json
+          skip-setup-trivy: true
+      - name: SBOM CycloneDX (frontend)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: analytics-dashboard:ci
+          format: cyclonedx
+          output: sbom-analytics-dashboard.cdx.json
+          skip-setup-trivy: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom-*.cdx.json
+          retention-days: 90

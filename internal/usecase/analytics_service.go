@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/dedup"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
 )
 
 const (
@@ -52,6 +52,7 @@ type SummaryStore interface {
 	RecordEvent(ctx context.Context, event *domain.Event) error
 	RecordDLQ(ctx context.Context) error
 	GetSummary(ctx context.Context, tenantID string) (domain.MetricSummary, error)
+	GetGlobalSummary(ctx context.Context) (domain.MetricSummary, error)
 }
 
 func (s *AnalyticsService) WithSummaryStore(store SummaryStore) *AnalyticsService {
@@ -127,6 +128,10 @@ func (s *AnalyticsService) GetHistoryForTenant(ctx context.Context, tenantID str
 // IngestEvent acepta el evento. En modo directo lo encola sin bloquear (ErrQueueFull si
 // no hay espacio); en modo publisher lo publica y espera la confirmación del broker.
 func (s *AnalyticsService) IngestEvent(e domain.Event) error {
+	return s.IngestEventContext(context.Background(), e)
+}
+
+func (s *AnalyticsService) IngestEventContext(parent context.Context, e domain.Event) error {
 	select {
 	case <-s.done:
 		return errors.New("analytics: service stopped")
@@ -142,7 +147,7 @@ func (s *AnalyticsService) IngestEvent(e domain.Event) error {
 	}
 
 	if s.publisher != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+		ctx, cancel := context.WithTimeout(parent, publishTimeout)
 		defer cancel()
 		if err := s.publisher.Publish(ctx, &e); err != nil {
 			return fmt.Errorf("analytics: publicar evento: %w", err)
@@ -158,20 +163,36 @@ func (s *AnalyticsService) IngestEvent(e domain.Event) error {
 	}
 }
 
-// RecordProcessed actualiza el resumen con eventos ya persistidos (modo publisher).
+// RecordProcessed actualiza el resumen local y el distribuido con eventos ya persistidos (modo publisher).
 func (s *AnalyticsService) RecordProcessed(events []*domain.Event) {
+	s.ApplyLocal(events)
+	if err := s.AggregateDistributed(context.Background(), events); err != nil {
+		slog.Error("analytics: actualizar resumen distribuido", "error", err)
+	}
+}
+
+// ApplyLocal actualiza solo el resumen en memoria.
+func (s *AnalyticsService) ApplyLocal(events []*domain.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range events {
 		s.apply(*e)
 	}
-	if s.summaryStore != nil {
-		for _, e := range events {
-			if err := s.summaryStore.RecordEvent(context.Background(), e); err != nil {
-				slog.Error("analytics: actualizar resumen distribuido", "error", err)
-			}
+}
+
+// AggregateDistributed registra los eventos en el almacén distribuido. Es idempotente por id de
+// evento, así que puede reintentarse tras un fallo sin duplicar contadores.
+func (s *AnalyticsService) AggregateDistributed(ctx context.Context, events []*domain.Event) error {
+	if s.summaryStore == nil {
+		return nil
+	}
+	var errs []error
+	for _, e := range events {
+		if err := s.summaryStore.RecordEvent(ctx, e); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // apply requiere s.mu tomado para escritura.
@@ -288,7 +309,7 @@ func (s *AnalyticsService) Stop() {
 // GetSummary retorna una copia del resumen actual, segura para uso concurrente.
 func (s *AnalyticsService) GetSummary() domain.MetricSummary {
 	if s.summaryStore != nil {
-		if summary, err := s.summaryStore.GetSummary(context.Background(), domain.DefaultTenant); err == nil {
+		if summary, err := s.summaryStore.GetGlobalSummary(context.Background()); err == nil {
 			return summary
 		} else {
 			slog.Error("analytics: leer resumen distribuido", "error", err)

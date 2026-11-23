@@ -1,0 +1,96 @@
+# Pruebas de las reglas de alertas: promtool test rules prometheus-rules.test.yml
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Se publican 100 eventos/min, pero solo se consumen 90 y el backlog no crece: pérdida.
+  - interval: 1m
+    input_series:
+      - series: analytics_nats_published_total
+        values: "0+100x60"
+      - series: analytics_nats_consumed_total
+        values: "0+90x60"
+      - series: analytics_nats_pending_messages
+        values: "0x60"
+      - series: analytics_nats_ack_pending_messages
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: AnalyticsEventLossSuspected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              slo: event-loss
+            exp_annotations:
+              summary: "Más del 0,1 % de los eventos publicados no aparece como consumido, en DLQ ni en backlog"
+              runbook: "docs/slo.md"
+
+  # Mismo desfase, pero explicado por el crecimiento del backlog (PostgreSQL caído): sin alerta.
+  - interval: 1m
+    input_series:
+      - series: analytics_nats_published_total
+        values: "0+100x60"
+      - series: analytics_nats_consumed_total
+        values: "0+90x60"
+      - series: analytics_nats_pending_messages
+        values: "0+10x60"
+      - series: analytics_nats_ack_pending_messages
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: AnalyticsEventLossSuspected
+        exp_alerts: []
+
+  # Duplicados reenviados por el cliente y descartados en el consumer: sin alerta.
+  - interval: 1m
+    input_series:
+      - series: analytics_nats_published_total
+        values: "0+100x60"
+      - series: analytics_nats_consumed_total
+        values: "0+90x60"
+      - series: 'analytics_dedup_dropped_total{stage="consumer"}'
+        values: "0+10x60"
+      - series: analytics_nats_pending_messages
+        values: "0x60"
+      - series: analytics_nats_ack_pending_messages
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: AnalyticsEventLossSuspected
+        exp_alerts: []
+
+  # 20 % de 5xx en la ingesta supera 14.4x el presupuesto (1 %): fast burn.
+  - interval: 1m
+    input_series:
+      - series: 'analytics_http_requests_total{path="/api/events",method="POST",code="202"}'
+        values: "0+80x70"
+      - series: 'analytics_http_requests_total{path="/api/events",method="POST",code="503"}'
+        values: "0+20x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: AnalyticsAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              slo: availability
+            exp_annotations:
+              summary: "La ingesta consume el presupuesto de error 14.4x más rápido de lo permitido"
+              description: "Errores 5xx en /api/events: 20% (1h)."
+              runbook: "docs/slo.md"
+
+  # 0,5 % de errores está dentro del presupuesto: ninguna alerta de burn-rate.
+  - interval: 1m
+    input_series:
+      - series: 'analytics_http_requests_total{path="/api/events",method="POST",code="202"}'
+        values: "0+995x70"
+      - series: 'analytics_http_requests_total{path="/api/events",method="POST",code="503"}'
+        values: "0+5x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: AnalyticsAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: AnalyticsAvailabilitySlowBurn
+        exp_alerts: []

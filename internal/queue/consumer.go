@@ -5,15 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
-	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/observability"
-	"github.com/Arierutemplar/REPO/analytics-service/internal/resilience"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/domain"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/observability"
+	"github.com/Arierutemplar/event-driven-microservices-ts/internal/resilience"
 )
 
 const (
@@ -129,12 +134,41 @@ func (c *Client) persistBatch(repo domain.BatchEventRepository, entries []entry,
 	}
 
 	// Contexto propio: un apagado no debe cortar una inserción en curso
+	links := make([]trace.Link, 0, len(entries))
+	for _, entry := range entries {
+		parent := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(http.Header(entry.msg.Headers())))
+		if sc := trace.SpanContextFromContext(parent); sc.IsValid() {
+			links = append(links, trace.Link{SpanContext: sc})
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	ctx, span := otel.Tracer("analytics/queue").Start(ctx, "nats process batch", trace.WithSpanKind(trace.SpanKindConsumer), trace.WithLinks(links...))
 	err := repo.SaveBatch(ctx, events)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "persist batch failed")
+		slog.ErrorContext(ctx, "queue: batch persist failed", "error", err, "events", len(events))
+	}
+	span.End()
 	cancel()
 
 	switch {
 	case err == nil:
+		// Los agregados se confirman antes del ack: si fallan, la reentrega los reintenta y el
+		// almacén los deduplica por id, así ningún evento persistido queda sin contar.
+		if c.Aggregate != nil {
+			aggCtx, aggCancel := context.WithTimeout(context.Background(), insertTimeout)
+			aggErr := c.Aggregate(aggCtx, events)
+			aggCancel()
+			if aggErr != nil {
+				slog.Error("queue: aggregate failed; messages will be redelivered", "error", aggErr, "events", len(events))
+				c.release(entries)
+				for _, e := range entries {
+					nak(e.msg, c.cfg.RetryDelay)
+				}
+				return
+			}
+		}
 		for _, e := range entries {
 			if aerr := e.msg.Ack(); aerr != nil {
 				// Si el ack se pierde habrá redelivery; msg_id evita el duplicado en la base

@@ -9,10 +9,19 @@ data:
   LOG_FORMAT: json
   CORS_ALLOWED_ORIGINS: https://analytics.example.com
   WS_ALLOWED_ORIGINS: https://analytics.example.com
+  # Production requires short-lived, tenant-bound tickets (POST /api/ws-ticket); see README.
+  WS_AUTH_MODE: ticket
+  WS_TICKET_TTL: 30s
   POSTGRES_PORT: "5432"
-  POSTGRES_SSLMODE: require
+  POSTGRES_SSLMODE: verify-full
+  # Replace with the actual ingress-controller source CIDRs in an overlay.
+  TRUSTED_PROXY_CIDRS: ""
+  OTEL_TRACING_ENABLED: "false"
   NATS_SUBJECT: events.ingest
   NATS_DURABLE: analytics-batch-writer
   BATCH_SIZE: "500"
   BATCH_FLUSH_INTERVAL: 1s
   REDIS_PREFIX: analytics
+  # 3 requires a 3-node NATS cluster; with 1 an accepted event does not survive losing the node.
+  NATS_STREAM_REPLICAS: "3"
+  NATS_STREAM_MAX_AGE: 72h
