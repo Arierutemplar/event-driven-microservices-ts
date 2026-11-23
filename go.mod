@@ -3,7 +3,7 @@ module github.com/Arierutemplar/event-driven-microservices-ts
 go 1.27.4
 
 require (
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/nats-io/nats.go v1.56.0
