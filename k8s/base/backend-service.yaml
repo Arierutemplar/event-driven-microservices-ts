@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-backend
+  namespace: analytics
+spec:
+  selector:
+    app: analytics-backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

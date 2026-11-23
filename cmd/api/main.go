@@ -11,11 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Arierutemplar/REPO/analytics-service/internal/dedup"
+	"github.com/Arierutemplar/REPO/analytics-service/internal/distributed"
 	"github.com/Arierutemplar/REPO/analytics-service/internal/domain"
 	"github.com/Arierutemplar/REPO/analytics-service/internal/handler"
 	"github.com/Arierutemplar/REPO/analytics-service/internal/middleware"
@@ -86,12 +88,12 @@ func envDuration(name string, def time.Duration) time.Duration {
 // newEventRepository usa PostgreSQL (protegido por un circuit breaker) cuando POSTGRES_HOST
 // está definido; si no, cae a un repositorio solo en memoria (útil para desarrollo y pruebas).
 // El gate bloquea mientras el circuito esté abierto; es nil si no hay breaker.
-func newEventRepository() (domain.BatchEventRepository, io.Closer, func(context.Context) error, error) {
+func newEventRepository() (domain.BatchEventRepository, io.Closer, func(context.Context) error, func(context.Context) error, error) {
 	host := os.Getenv("POSTGRES_HOST")
 	if host == "" {
 		slog.Warn("POSTGRES_HOST no definido: usando repositorio en memoria (sin persistencia)")
 		r, err := repository.NewMemoryRepository(10000, "")
-		return r, r, nil, err
+		return r, r, nil, nil, err
 	}
 
 	cfg := repository.PostgresConfig{
@@ -107,7 +109,7 @@ func newEventRepository() (domain.BatchEventRepository, io.Closer, func(context.
 
 	r, err := repository.NewPostgresRepository(ctx, cfg.DSN())
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	slog.Info("PostgreSQL conectado", "host", cfg.Host, "port", cfg.Port, "db", cfg.DBName)
 
@@ -127,7 +129,7 @@ func newEventRepository() (domain.BatchEventRepository, io.Closer, func(context.
 		OpenTimeout:         envDuration("DB_BREAKER_OPEN_TIMEOUT", 15*time.Second),
 		SlowThreshold:       envDuration("DB_BREAKER_SLOW_THRESHOLD", 5*time.Second),
 	})
-	return guarded, r, guarded.WaitReady, nil
+	return guarded, r, guarded.WaitReady, r.Ping, nil
 }
 
 // waitDone espera a done o a que venza ctx; retorna true si terminó a tiempo.
@@ -153,8 +155,34 @@ func main() {
 // lugar de abortar para que los defer de limpieza se ejecuten.
 func run() error {
 	slog.Info("iniciando microservicio de analíticas")
+	if strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") {
+		if os.Getenv("API_KEY") == "" && os.Getenv("TENANT_API_KEYS") == "" {
+			return errors.New("producción requiere API_KEY o TENANT_API_KEYS")
+		}
+		if os.Getenv("POSTGRES_HOST") == "" {
+			return errors.New("producción requiere POSTGRES_HOST")
+		}
+		if os.Getenv("NATS_URL") == "" {
+			return errors.New("producción requiere NATS_URL")
+		}
+		if os.Getenv("REDIS_URL") == "" {
+			return errors.New("producción requiere REDIS_URL")
+		}
+		if os.Getenv("CORS_ALLOWED_ORIGINS") == "" {
+			return errors.New("producción requiere CORS_ALLOWED_ORIGINS")
+		}
+		if os.Getenv("CORS_ALLOWED_ORIGINS") == "*" {
+			return errors.New("producción no permite CORS_ALLOWED_ORIGINS=*")
+		}
+		if os.Getenv("WS_ALLOWED_ORIGINS") == "" {
+			return errors.New("producción requiere WS_ALLOWED_ORIGINS")
+		}
+		if os.Getenv("WS_ALLOWED_ORIGINS") == "*" {
+			return errors.New("producción no permite WS_ALLOWED_ORIGINS=*")
+		}
+	}
 
-	eventRepo, closer, dbGate, err := newEventRepository()
+	eventRepo, closer, dbGate, dbPing, err := newEventRepository()
 	if err != nil {
 		return fmt.Errorf("inicializar repositorio: %w", err)
 	}
@@ -167,7 +195,7 @@ func run() error {
 	analyticsHandler := handler.NewAnalyticsHandler(analyticsService)
 
 	// Handler WebSocket y difusor en segundo plano
-	wsHandler := handler.NewWSHandler()
+	wsHandler := handler.NewWSHandlerWithOrigins(os.Getenv("WS_ALLOWED_ORIGINS"))
 	go wsHandler.HandleMessages()
 
 	broadcastSummary := func() {
@@ -182,6 +210,18 @@ func run() error {
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var redisStore *distributed.RedisStore
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		ctx, cancel := context.WithTimeout(rootCtx, 10*time.Second)
+		redisStore, err = distributed.NewRedisStore(ctx, redisURL, envString("REDIS_PREFIX", "analytics"))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("conectar Redis: %w", err)
+		}
+		analyticsService.WithSummaryStore(redisStore)
+		slog.Info("estado distribuido conectado", "backend", "Redis")
+	}
+
 	// El consumer tiene su propio contexto: se cancela después de cerrar HTTP, para que
 	// no quede nada publicándose mientras se detiene la lectura de JetStream.
 	consumerCtx, stopConsumer := context.WithCancel(context.Background())
@@ -192,6 +232,7 @@ func run() error {
 		consumerDone chan struct{}
 		ingest       http.HandlerFunc
 	)
+	var natsReady atomic.Bool
 
 	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
 		// Modo cola: el POST publica en JetStream (202 = mensaje durable) y un consumer
@@ -211,6 +252,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("conectar a NATS: %w", err)
 		}
+		natsReady.Store(true)
 		slog.Info("NATS JetStream conectado", "url", natsURL)
 
 		analyticsService.WithPublisher(qc)
@@ -250,7 +292,6 @@ func run() error {
 	exportDone := startExporter(exportCtx, closer)
 
 	// Seguridad: API_KEY vacío desactiva la verificación (modo opcional)
-	requireKey := middleware.APIKeyFunc(os.Getenv("API_KEY"))
 	if os.Getenv("API_KEY") == "" {
 		slog.Warn("API_KEY no definida: rutas de lectura sin autenticación")
 	}
@@ -274,8 +315,21 @@ func run() error {
 	}
 	stopLimiter := make(chan struct{})
 	defer close(stopLimiter)
-	limiter := middleware.NewRateLimiter(
-		envFloat("RATE_LIMIT_RPS", 20), envInt("RATE_LIMIT_BURST", 40), stopLimiter)
+	rps := envFloat("RATE_LIMIT_RPS", 20)
+	burst := envInt("RATE_LIMIT_BURST", 40)
+	var limiter middleware.RequestLimiter
+	var redisLimiter *middleware.RedisRateLimiter
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		ctx, cancel := context.WithTimeout(rootCtx, 10*time.Second)
+		redisLimiter, err = middleware.NewRedisRateLimiter(ctx, redisURL, rps, burst, envString("REDIS_PREFIX", "analytics"))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("conectar Redis para rate limiting: %w", err)
+		}
+		limiter = redisLimiter
+	} else {
+		limiter = middleware.NewRateLimiter(rps, burst, stopLimiter)
+	}
 
 	// Rutas HTTP. Instrument va por fuera para contar también 401/429.
 	var shuttingDown atomic.Bool
@@ -291,13 +345,33 @@ func run() error {
 			http.Error(w, "apagando", http.StatusServiceUnavailable)
 			return
 		}
+		if dbPing != nil {
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+			defer pingCancel()
+			if err := dbPing(pingCtx); err != nil {
+				http.Error(w, "base de datos no disponible", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		if os.Getenv("NATS_URL") != "" && !natsReady.Load() {
+			http.Error(w, "NATS no disponible", http.StatusServiceUnavailable)
+			return
+		}
+		if os.Getenv("NATS_URL") != "" && qc != nil {
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+			defer pingCancel()
+			if err := qc.Ping(pingCtx); err != nil {
+				http.Error(w, "NATS no disponible", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
 	// El limitador va por fuera de la autenticación: frena también la fuerza bruta de claves
 	http.HandleFunc("/api/events", observability.Instrument("/api/events", limiter.Limit(tenantAuth.Ingest(ingest))))
-	http.HandleFunc("/api/events/history", observability.Instrument("/api/events/history", requireKey(analyticsHandler.HandleHistory)))
-	http.HandleFunc("/api/metrics", observability.Instrument("/api/metrics", requireKey(analyticsHandler.HandleSummary)))
+	http.HandleFunc("/api/events/history", observability.Instrument("/api/events/history", tenantAuth.Read(analyticsHandler.HandleHistory)))
+	http.HandleFunc("/api/metrics", observability.Instrument("/api/metrics", tenantAuth.Read(analyticsHandler.HandleSummary)))
 	http.Handle("/metrics", middleware.APIKey(os.Getenv("API_KEY"))(promhttp.Handler()))
 	// Operaciones de DLQ: solo administrador (falla cerrado sin API_KEY) y con limitador propio y estricto
 	var dlqMgr domain.DLQManager
@@ -317,10 +391,15 @@ func run() error {
 	// CORS envuelve todo el mux (DefaultServeMux) de forma global. Los timeouts de cabeceras y
 	// de inactividad protegen frente a clientes lentos sin cortar las conexiones WebSocket.
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           middleware.CORS(http.DefaultServeMux),
+		Addr: addr,
+		Handler: middleware.RequestContext(
+			middleware.CORSAllowed(os.Getenv("CORS_ALLOWED_ORIGINS"), http.DefaultServeMux),
+		),
+		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -369,8 +448,19 @@ func run() error {
 	}
 	wsHandler.Close()
 	if qc != nil {
+		natsReady.Store(false)
 		if err := qc.Close(); err != nil {
 			slog.Error("apagado: cierre de NATS", "error", err)
+		}
+	}
+	if redisLimiter != nil {
+		if err := redisLimiter.Close(); err != nil {
+			slog.Error("apagado: cierre de Redis rate limiter", "error", err)
+		}
+	}
+	if redisStore != nil {
+		if err := redisStore.Close(); err != nil {
+			slog.Error("apagado: cierre de Redis store", "error", err)
 		}
 	}
 	if err := closer.Close(); err != nil {

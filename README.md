@@ -2,6 +2,16 @@
 
 Plataforma de analíticas de eventos en tiempo real. Una API en Go recibe eventos multi-tenant, los publica en **NATS JetStream**, un consumer los inserta por lotes en **PostgreSQL** (con reintentos, circuit breaker, deduplicación y Dead Letter Queue), un exportador los vuelca periódicamente a un **data lake Parquet en MinIO/S3**, y el resumen de métricas se difunde por **WebSocket** a un dashboard **React**. Todo está instrumentado con **Prometheus** y **Grafana**.
 
+## Enterprise baseline
+
+- Redis comparte el resumen de métricas y el rate limiting entre réplicas cuando `REDIS_URL` está definido.
+- Producción exige PostgreSQL, NATS, Redis y autenticación; CORS/WebSocket no permiten `*`.
+- Las migraciones quedan registradas en `schema_migrations`; los duplicados históricos se archivan antes de aplicar unicidad.
+- Todas las respuestas HTTP incluyen `X-Request-ID` para correlación operativa.
+- Prometheus incluye reglas SLO/alertas y `docs/runbooks/` describe el procedimiento ante incidentes.
+- `k8s/base/` contiene la base Kustomize con HPA, PDB, probes y límites de recursos.
+- Los secretos de Kubernetes deben venir de External Secrets, Sealed Secrets o el proveedor cloud; no apliques `secrets.example.yaml` tal cual.
+
 ## Stack tecnológico
 
 | Capa | Tecnología |
@@ -131,6 +141,21 @@ Abre el dashboard en <http://localhost> y Grafana en <http://localhost:3002>. Pa
 
 > La imagen de MinIO por defecto es `cgr.dev/chainguard/minio` (MinIO ya no publica `minio/minio` en Docker Hub). Cámbiala con `MINIO_IMAGE`.
 > **Producción**: cambia las credenciales de PostgreSQL, MinIO y Grafana, y define `API_KEY`, `TENANT_API_KEYS` y `WS_TOKEN`.
+
+### Modo producción
+
+El backend exige `ENVIRONMENT=production` junto con PostgreSQL y NATS reales, autenticación (`API_KEY` o `TENANT_API_KEYS`) y listas explícitas de orígenes CORS/WebSocket:
+
+```bash
+ENVIRONMENT=production
+POSTGRES_HOST=postgres.internal
+NATS_URL=nats://nats.internal:4222
+API_KEY=<secreto-externo>
+CORS_ALLOWED_ORIGINS=https://analytics.example.com
+WS_ALLOWED_ORIGINS=https://analytics.example.com
+```
+
+La especificación HTTP versionada está en [`openapi.yaml`](./openapi.yaml). `/health` expresa liveness y `/ready` falla mientras PostgreSQL, NATS o el proceso de apagado impidan recibir tráfico.
 
 Grafana arranca con Prometheus como fuente de datos y dos dashboards aprovisionados desde `grafana/` (carpeta *Analytics*): **Overview** (eventos, EPS, RPS, latencia p50/p95/p99, rechazos 429/503) y **NATS & Backend** (JetStream, DLQ, batch inserts).
 

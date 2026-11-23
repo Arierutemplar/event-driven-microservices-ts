@@ -2,3 +2,8 @@
 events.jsonl
 *.log
 logs/
+node_modules/
+dist/
+coverage/
+.env.local
+.env.*.local

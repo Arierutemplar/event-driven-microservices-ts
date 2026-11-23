@@ -17,6 +17,12 @@ type EventRepository interface {
 	GetHistory(ctx context.Context, limit int) ([]*Event, error)
 }
 
+// TenantHistoryRepository permite consultas acotadas a un tenant.
+// Las implementaciones deben tratar tenant vacío como DefaultTenant.
+type TenantHistoryRepository interface {
+	GetHistoryForTenant(ctx context.Context, tenantID string, limit int) ([]*Event, error)
+}
+
 // BatchEventRepository añade la inserción masiva. Si el evento trae MessageID,
 // la inserción es idempotente.
 type BatchEventRepository interface {

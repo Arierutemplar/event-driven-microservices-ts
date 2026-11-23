@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: analytics-backend
+  namespace: analytics
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: analytics-backend

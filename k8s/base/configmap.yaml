@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: analytics-config
+  namespace: analytics
+data:
+  ENVIRONMENT: production
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+  CORS_ALLOWED_ORIGINS: https://analytics.example.com
+  WS_ALLOWED_ORIGINS: https://analytics.example.com
+  POSTGRES_PORT: "5432"
+  POSTGRES_SSLMODE: require
+  NATS_SUBJECT: events.ingest
+  NATS_DURABLE: analytics-batch-writer
+  BATCH_SIZE: "500"
+  BATCH_FLUSH_INTERVAL: 1s
+  REDIS_PREFIX: analytics

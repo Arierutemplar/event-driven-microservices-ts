@@ -1,0 +1,78 @@
+openapi: 3.1.0
+info:
+  title: Analytics Event Service
+  version: 2.0.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        "200": {description: Process is alive}
+  /ready:
+    get:
+      summary: Readiness
+      responses:
+        "200": {description: Dependencies are available}
+        "503": {description: Dependency or shutdown state}
+  /api/events:
+    post:
+      summary: Publish an analytics event
+      parameters:
+        - in: header
+          name: X-API-Key
+          schema: {type: string}
+        - in: header
+          name: X-Tenant-ID
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_type]
+              properties:
+                id: {type: string, maxLength: 256}
+                event_type: {type: string, maxLength: 128}
+                user_id: {type: string, maxLength: 256}
+                payload: {}
+                timestamp: {type: string, format: date-time}
+      responses:
+        "202": {description: Event accepted}
+        "400": {description: Invalid event}
+        "401": {description: Missing or invalid API key}
+        "403": {description: Tenant mismatch}
+        "429": {description: Rate limited}
+        "503": {description: Queue unavailable or queue full}
+  /api/events/history:
+    get:
+      summary: Tenant-scoped event history
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 50}
+        - in: header
+          name: X-API-Key
+          schema: {type: string}
+        - in: header
+          name: X-Tenant-ID
+          schema: {type: string}
+      responses:
+        "200": {description: Recent events for the authorized tenant}
+        "401": {description: Missing or invalid API key}
+        "403": {description: Tenant mismatch}
+  /api/metrics:
+    get:
+      summary: Tenant-scoped metrics summary
+      parameters:
+        - in: header
+          name: X-API-Key
+          schema: {type: string}
+        - in: header
+          name: X-Tenant-ID
+          schema: {type: string}
+      responses:
+        "200": {description: Metrics for the authorized tenant}
+        "401": {description: Missing or invalid API key}

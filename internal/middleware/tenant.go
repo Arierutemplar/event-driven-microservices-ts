@@ -157,3 +157,44 @@ func (a *TenantAuth) Ingest(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r.WithContext(context.WithValue(r.Context(), tenantCtxKey{}, tenant)))
 	}
 }
+
+// Read protege los endpoints de lectura y fija el tenant autorizado en el contexto.
+// Las claves de tenant solo pueden leer su propio tenant; API_KEY puede elegir
+// X-Tenant-ID y, sin cabecera, usa el tenant default.
+func (a *TenantAuth) Read(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		headerTenant := strings.TrimSpace(r.Header.Get(HeaderTenantID))
+		tenant := headerTenant
+
+		if a.Enabled() {
+			key := r.Header.Get(HeaderAPIKey)
+			if key == "" {
+				observability.AuthRejected(r.URL.Path, "missing_key")
+				http.Error(w, "API key ausente", http.StatusUnauthorized)
+				return
+			}
+			cred, ok := a.lookup(key)
+			if !ok {
+				observability.AuthRejected(r.URL.Path, "invalid_key")
+				http.Error(w, "API key inválida", http.StatusUnauthorized)
+				return
+			}
+			if cred.tenant != "" {
+				if headerTenant != "" && headerTenant != cred.tenant {
+					observability.AuthRejected(r.URL.Path, "tenant_mismatch")
+					http.Error(w, "la API key no pertenece a ese tenant", http.StatusForbidden)
+					return
+				}
+				tenant = cred.tenant
+			}
+		}
+
+		if tenant == "" {
+			tenant = domain.DefaultTenant
+		} else if !ValidTenantID(tenant) {
+			http.Error(w, "X-Tenant-ID inválido", http.StatusBadRequest)
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), tenantCtxKey{}, tenant)))
+	}
+}

@@ -1,0 +1,50 @@
+groups:
+  - name: analytics-service
+    rules:
+      - alert: AnalyticsHighHTTPErrorRate
+        expr: |
+          sum(rate(analytics_http_requests_total{code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(analytics_http_requests_total[5m])), 1) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Analytics HTTP 5xx rate above 1%"
+          runbook: "docs/runbooks/service-overview.md"
+
+      - alert: AnalyticsDLQBacklog
+        expr: analytics_dlq_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DLQ backlog exceeds 100 messages"
+          runbook: "docs/runbooks/dlq.md"
+
+      - alert: AnalyticsNATSBacklog
+        expr: analytics_nats_pending_messages > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NATS consumer backlog is high"
+          runbook: "docs/runbooks/nats.md"
+
+      - alert: AnalyticsCircuitBreakerOpen
+        expr: analytics_circuit_breaker_state > 1.5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Analytics PostgreSQL circuit breaker is open"
+          runbook: "docs/runbooks/database.md"
+
+      - alert: AnalyticsExporterStalled
+        expr: time() - analytics_parquet_last_success_timestamp_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Parquet exporter has not succeeded for one hour"
+          runbook: "docs/runbooks/export.md"

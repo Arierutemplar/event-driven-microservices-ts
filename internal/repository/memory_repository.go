@@ -134,6 +134,34 @@ func (r *MemoryRepository) GetHistory(ctx context.Context, limit int) ([]*domain
 	return out, nil
 }
 
+// GetHistoryForTenant devuelve los eventos recientes pertenecientes exclusivamente al tenant.
+func (r *MemoryRepository) GetHistoryForTenant(ctx context.Context, tenantID string, limit int) ([]*domain.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tenantID == "" {
+		tenantID = domain.DefaultTenant
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]*domain.Event, 0)
+	if limit <= 0 {
+		limit = r.size
+	}
+	for i := 1; i <= r.size && len(out) < limit; i++ {
+		idx := (r.next - i + r.capacity) % r.capacity
+		e := r.buf[idx]
+		if e.TenantID != tenantID {
+			continue
+		}
+		cp := *e
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
 // Close libera el archivo de persistencia, si existe.
 func (r *MemoryRepository) Close() error {
 	r.mu.Lock()

@@ -211,6 +211,20 @@ func (c *Client) Close() error {
 	return c.nc.Drain()
 }
 
+// Ping comprueba que la conexión NATS esté abierta y que pueda enviar un flush.
+func (c *Client) Ping(ctx context.Context) error {
+	if c == nil || c.nc == nil {
+		return fmt.Errorf("queue: conexión no inicializada")
+	}
+	if c.nc.Status() != nats.CONNECTED && c.nc.Status() != nats.RECONNECTING {
+		return fmt.Errorf("queue: estado NATS %s", c.nc.Status())
+	}
+	if err := c.nc.FlushWithContext(ctx); err != nil {
+		return fmt.Errorf("queue: flush NATS: %w", err)
+	}
+	return nil
+}
+
 func newMsgID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

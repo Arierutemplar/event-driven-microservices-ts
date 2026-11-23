@@ -49,6 +49,13 @@ func (r *BreakerRepository) GetHistory(ctx context.Context, limit int) ([]*domai
 	return r.next.GetHistory(ctx, limit)
 }
 
+func (r *BreakerRepository) GetHistoryForTenant(ctx context.Context, tenantID string, limit int) ([]*domain.Event, error) {
+	if scoped, ok := r.next.(domain.TenantHistoryRepository); ok {
+		return scoped.GetHistoryForTenant(ctx, tenantID, limit)
+	}
+	return nil, errors.New("repository: tenant history not supported")
+}
+
 // State expone el estado del circuito.
 func (r *BreakerRepository) State() resilience.State { return r.breaker.State() }
 

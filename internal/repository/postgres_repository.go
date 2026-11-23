@@ -107,18 +107,39 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}()
 
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			name TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`); err != nil {
+		return fmt.Errorf("repository: crear tabla de migraciones: %w", err)
+	}
+
 	// ReadDir devuelve las entradas ordenadas por nombre (001_, 002_, ...)
 	files, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("repository: leer migraciones: %w", err)
 	}
 	for _, f := range files {
+		var applied bool
+		if err := conn.QueryRow(ctx,
+			"SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = $1)",
+			f.Name()).Scan(&applied); err != nil {
+			return fmt.Errorf("repository: consultar migración %s: %w", f.Name(), err)
+		}
+		if applied {
+			continue
+		}
 		sql, err := migrationsFS.ReadFile("migrations/" + f.Name())
 		if err != nil {
 			return fmt.Errorf("repository: leer %s: %w", f.Name(), err)
 		}
 		if _, err := conn.Exec(ctx, string(sql)); err != nil {
 			return fmt.Errorf("repository: aplicar %s: %w", f.Name(), err)
+		}
+		if _, err := conn.Exec(ctx,
+			"INSERT INTO schema_migrations (name) VALUES ($1)", f.Name()); err != nil {
+			return fmt.Errorf("repository: registrar migración %s: %w", f.Name(), err)
 		}
 	}
 	return nil
@@ -219,6 +240,44 @@ func (r *PostgresRepository) GetHistory(ctx context.Context, limit int) ([]*doma
 		 LIMIT $1`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("repository: consultar historial: %w", err)
+	}
+	defer rows.Close()
+
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*domain.Event, error) {
+		var (
+			e       domain.Event
+			payload []byte
+		)
+		if err := row.Scan(&e.ID, &e.EventType, &e.UserID, &e.TenantID, &payload, &e.Timestamp); err != nil {
+			return nil, err
+		}
+		if payload != nil {
+			e.Payload = json.RawMessage(payload)
+		}
+		return &e, nil
+	})
+}
+
+// GetHistoryForTenant consulta únicamente eventos de un tenant.
+func (r *PostgresRepository) GetHistoryForTenant(ctx context.Context, tenantID string, limit int) ([]*domain.Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if tenantID == "" {
+		tenantID = domain.DefaultTenant
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT event_id, event_type, user_id, tenant_id, payload, created_at
+		 FROM events
+		 WHERE tenant_id = $1
+		 ORDER BY created_at DESC, id DESC
+		 LIMIT $2`, tenantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("repository: consultar historial por tenant: %w", err)
 	}
 	defer rows.Close()
 

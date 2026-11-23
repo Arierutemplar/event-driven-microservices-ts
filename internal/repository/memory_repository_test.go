@@ -55,3 +55,18 @@ func TestConcurrentSave(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestHistoryIsScopedByTenant(t *testing.T) {
+	r, _ := NewMemoryRepository(20, "")
+	_ = r.Save(context.Background(), &domain.Event{ID: "a1", TenantID: "acme"})
+	_ = r.Save(context.Background(), &domain.Event{ID: "b1", TenantID: "globex"})
+	_ = r.Save(context.Background(), &domain.Event{ID: "a2", TenantID: "acme"})
+
+	got, err := r.GetHistoryForTenant(context.Background(), "acme", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "a2" || got[1].ID != "a1" {
+		t.Fatalf("historial filtrado inesperado: %+v", got)
+	}
+}

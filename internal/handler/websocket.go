@@ -3,6 +3,8 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +24,34 @@ type WSHandler struct {
 
 // NewWSHandler crea un WSHandler con CORS abierto (CheckOrigin permisivo) y cola de difusión acotada.
 func NewWSHandler() *WSHandler {
+	return NewWSHandlerWithOrigins(os.Getenv("WS_ALLOWED_ORIGINS"))
+}
+
+// NewWSHandlerWithOrigins habilita restricciones de origen para producción.
+// Una lista vacía conserva el modo permisivo por compatibilidad de desarrollo.
+func NewWSHandlerWithOrigins(allowed string) *WSHandler {
+	origins := make(map[string]struct{})
+	for _, origin := range strings.Split(allowed, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins[origin] = struct{}{}
+		}
+	}
 	return &WSHandler{
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				if len(origins) == 0 {
+					return true
+				}
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true
+				}
+				if _, ok := origins["*"]; ok {
+					return true
+				}
+				_, ok := origins[origin]
+				return ok
+			},
 		},
 		clients:   make(map[*websocket.Conn]struct{}),
 		broadcast: make(chan []byte, 256),

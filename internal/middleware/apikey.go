@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
+	"strings"
 )
 
 // APIKey exige la cabecera X-API-Key. Si `key` está vacío, la verificación
@@ -16,7 +17,13 @@ func APIKey(key string) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			got := sha256.Sum256([]byte(r.Header.Get("X-API-Key")))
+			key := r.Header.Get("X-API-Key")
+			if key == "" {
+				if auth := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+					key = strings.TrimSpace(auth[len("Bearer "):])
+				}
+			}
+			got := sha256.Sum256([]byte(key))
 			// Comparar hashes de longitud fija evita filtrar datos por tiempo.
 			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 				http.Error(w, "API key inválida o ausente", http.StatusUnauthorized)
